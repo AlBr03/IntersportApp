@@ -1,0 +1,143 @@
+1) Stop met “SELECT *” + vaste kolom-indexen (maakt bugs onvermijdelijk)
+
+Je gebruikt veel row[12], row[13] enz. voor created_at en reminder_last_sent_at. Dat is kwetsbaar: één kolom extra of andere SELECT-volgorde en je reminders breken stilletjes. 
+
+app
+
+
+Beter:
+
+Zet sqlite3.Row als row_factory en gebruik naamvelden (row["created_at"]).
+
+Of selecteer expliciet kolommen: SELECT id, klantnaam, ... created_at, reminder_last_sent_at FROM requests ...
+
+2) Maak reminders DB-side efficiënter (nu laad je alles en filter je in Python)
+
+Je haalt alle open requests op en filtert daarna in Python. 
+
+app
+
+
+Beter (sneller en minder foutgevoelig):
+
+Filter in SQL met WHERE afgerond=0 AND created_at <= ? AND (reminder_last_sent_at IS NULL OR reminder_last_sent_at <= ?)
+
+Voeg indexes toe op afgerond, created_at, reminder_last_sent_at.
+
+3) UI blijft “blokkerig” bij mail sturen → verplaats e-mail naar een worker thread
+
+smtplib.SMTP_SSL(...).send_message(...) draait op de UI-thread. Als SMTP traag is, “hangt” je app. 
+
+app
+
+
+Beter:
+
+Gebruik QThread/QRunnable (ThreadPool) voor mail-sends.
+
+Toon progress + resultaten (bijv. “3 verzonden, 1 mislukt”).
+
+4) Kies één settings-systeem: DB óf JSON (nu is het dubbel/confusing)
+
+Je maakt een settings tabel aan in SQLite, maar gebruikt in de praktijk settings.json via get_setting()/set_setting(). 
+
+app
+
+
+Beter:
+
+Of verwijder de DB settings-table helemaal,
+
+Of migreer settings volledig naar SQLite (mijn voorkeur: alles in één database, makkelijker deploy/backup).
+
+5) Consistente datum/tijd: gebruik UTC (of timezone-aware) en één format
+
+Je gebruikt _dt_str(datetime.now()) en parse’t met meerdere formats. 
+
+app
+
+
+Beter:
+
+Sla timestamps op als ISO 8601 UTC (bv. datetime.now(timezone.utc).isoformat()).
+
+Parse altijd met fromisoformat.
+
+Dan is “7 dagen” ook écht 7×24 uur consistent.
+
+6) Dashboard UX: filtering + zoeken + “Alleen openstaand”
+
+Je hebt sorting uit staan bij populaten en vult alles “plat” in de QTableWidget. 
+
+app
+
+
+Beter:
+
+Voeg een zoekbalk (“klant/verkoper/product/opmerking”) en quick filters toe:
+
+✅ Alleen openstaand
+
+🔥 Ouder dan 7 dagen
+
+🟨 Status filters (contact/betaal/bestel)
+
+Overweeg QTableView + QSortFilterProxyModel i.p.v. QTableWidget (veel krachtiger en sneller bij groei).
+
+7) Data-validatie verbeteren (telefoon/e-mail is goed begin, maar maak het strakker)
+
+Je valideert e-mail/telefoon en prijs parsing al netjes. 
+
+app
+
+
+Aanvullingen die in winkels vaak helpen:
+
+“Verkoper” dropdown i.p.v. vrije tekst (minder varianten/spelfouten)
+
+Prijs: ook euro-teken/spaties tolereren, en standaard 2 decimalen
+
+opmerking is nu QLineEdit → overweeg QPlainTextEdit (multi-line) en toon in tabel als ingekorte preview + tooltip.
+
+8) Logging & foutfeedback (nu vooral print)
+
+Je print fouten bij auto-reminders. 
+
+app
+
+
+Beter:
+
+Gebruik logging met een logfile (app.log)
+
+Voeg in “Instellingen” een knop toe: “Open logbestand”
+
+Toon bij auto-reminders een subtiele status in de UI (bijv. label in header: “laatste check: 13:00 — 2 verzonden”)
+
+9) Reminders “idempotent” en veiliger maken
+
+Je update reminder_last_sent_at pas ná een succesvolle send (goed). 
+
+app
+
+
+Maar voor betrouwbaarheid:
+
+Zet een “attempted_at” of “last_error” veld (handig voor diagnose)
+
+Voeg een “mute/snooze” optie per request toe (bv. snooze 7/14 dagen)
+
+10) Kleine polish voor styling en consistentie
+
+Je laadt QSS, met fallback stylesheet. 
+
+app
+
+
+Verbeteringen:
+
+Zet alle kleuren/spacing in één “design constants” blok (zowel in QSS als in Python waar nodig)
+
+Zorg dat dynamische combobox-styles (via setStyleSheet in apply_combo_colors) niet gaat “bijten” met globale QSS (liefst: alleen per-item roles + beperkte inline style). 
+
+app

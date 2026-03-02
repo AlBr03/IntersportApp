@@ -1,0 +1,28 @@
+volgende keer:
+Stap 3 uit chat prompt toevoegen
+
+Checken hoe makkelijk updates uitrollen na initial launch
+
+verplicht email of telefoon
+
+artikelnummer + extra balkje voor EAN (verplicht)
+
+Naast aangesproken filiaal uitvoerende collega toevoegen
+
+Bij opslaan in database automatische mail om klant te bedanken. Afsluiten met naam verkoper
+
+Whatsapp API (Op locatie uitvoeren)
+
+Mijn eigen naam weergeven in het instellingen tabje of ergens heel klein
+
+Onder Filiaal: toeoegen leverancier en verplicht veld maken
+
+cellen in dashboard de goede lengte maken per cel (maak een entry met in alle cellen de langste waarde en check)
+
+verwijder bestellingen gemarkeerd als afgerond precies 24 uur na dat deze als afgerond zijn gemarkeerd
+kijk naar de opmaak van de UI
+
+Notes:
+Ultieme testronde van alle functionaliteiten (plan opstellen met ChatGPT)
+Uitlegblad maken voor gebruikers
+verander teksten in de emails
