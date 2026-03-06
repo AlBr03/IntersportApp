@@ -51,7 +51,8 @@ from PySide6.QtWidgets import (
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 465
 SENDER_EMAIL = "intersportreminders@gmail.com"
-APP_PASSWORD = os.getenv("EMAIL_PASS", "").strip()
+#APP_PASSWORD = os.getenv("EMAIL_PASS", "").strip()
+APP_PASSWORD = "jqfa pqxk rpgy lydx"
 
 APP_NAME = "IntersportApp"
 DB_FILENAME = "store.db"
@@ -121,7 +122,7 @@ def _normalize_phone(raw: str) -> str | None:
 def validate_email_or_phone(value: str) -> tuple[bool, str, str]:
     v = (value or "").strip()
     if not v:
-        return True, "", ""
+        return False, "", "Vul een geldig e-mailadres of telefoonnummer in."
 
     phone_norm = _normalize_phone(v)
     if phone_norm is not None:
@@ -291,7 +292,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 klantnaam TEXT NOT NULL,
                 verkoper TEXT NOT NULL,
-                email TEXT,
+                email TEXT NOT NULL,
                 opmerking TEXT NOT NULL,
                 filiaal TEXT,
                 contactstatus TEXT,
@@ -576,7 +577,7 @@ class MainWindow(QWidget):
 
         form.addRow("Klantnaam *", self.inputs["klant"])
         form.addRow("Verkoper *", self.inputs["verkoper"])
-        form.addRow("E-mail of Telefoonnummer", self.inputs["email"])
+        form.addRow("E-mail of Telefoonnummer *", self.inputs["email"])
         form.addRow("Opmerking *", self.inputs["opmerking"])
         form.addRow("Productcode", self.inputs["product"])
         form.addRow("Adviesprijs", self.inputs["prijs"])
@@ -661,6 +662,7 @@ class MainWindow(QWidget):
         self._setup_table(self.table_open)
         self.table_open.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table_open.customContextMenuRequested.connect(lambda pos: self.show_context_menu(self.table_open, pos))
+        self.table_open.itemDoubleClicked.connect(lambda item: self.edit_row(self.table_open, item.row()))
 
         open_layout.addWidget(open_label)
         open_layout.addWidget(self.table_open)
@@ -678,6 +680,7 @@ class MainWindow(QWidget):
         self._setup_table(self.table_done)
         self.table_done.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table_done.customContextMenuRequested.connect(lambda pos: self.show_context_menu(self.table_done, pos))
+        self.table_done.itemDoubleClicked.connect(lambda item: self.edit_row(self.table_done, item.row()))
 
         done_layout.addWidget(done_label)
         done_layout.addWidget(self.table_done)
@@ -787,7 +790,7 @@ class MainWindow(QWidget):
         info.setObjectName("HintText")
         lay.addWidget(info)
 
-        credit = QLabel("© 2026 Alexander Brinkman. Alle rechten voorbehouden. V1.0.0")
+        credit = QLabel("© 2026 Alexander Brinkman. Alle rechten voorbehouden. V1.0.1.0")
         credit.setObjectName("FooterCredit")
         credit.setAlignment(Qt.AlignRight)
         lay.addWidget(credit)
@@ -834,10 +837,15 @@ class MainWindow(QWidget):
     def handle_add(self):
         klant = self.inputs["klant"].text().strip()
         verkoper = self.inputs["verkoper"].text().strip()
+        contact = self.inputs["email"].text().strip()
         opmerking = self.inputs["opmerking"].text().strip()
 
-        if not klant or not verkoper or not opmerking:
-            QMessageBox.warning(self, "Fout", "Verplichte velden ontbreken.")
+        if not klant or not verkoper or not contact or not opmerking:
+            QMessageBox.warning(
+                self,
+                "Fout",
+                "Klantnaam, Verkoper, E-mail of Telefoonnummer en Opmerking zijn verplicht."
+            )
             return
 
         ok, normalized_contact, err = validate_email_or_phone(self.inputs["email"].text())
@@ -1293,6 +1301,8 @@ class MainWindow(QWidget):
         apply_combo_colors(inputs["bestelstatus"], BESTELSTATUS_COLORS)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("Opslaan")
+        buttons.button(QDialogButtonBox.Cancel).setText("Annuleren")
         buttons.setObjectName("DialogButtons")
         layout.addRow(buttons)
 
@@ -1302,6 +1312,9 @@ class MainWindow(QWidget):
                 return
             if not inputs["verkoper"].text().strip():
                 QMessageBox.warning(dialog, "Fout", "Verkoper is verplicht.")
+                return
+            if not inputs["email"].text().strip():
+                QMessageBox.warning(dialog, "Fout", "E-mail of Telefoonnummer is verplicht.")
                 return
             if not inputs["opmerking"].text().strip():
                 QMessageBox.warning(dialog, "Fout", "Opmerking is verplicht.")
