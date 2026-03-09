@@ -852,7 +852,7 @@ class MainWindow(QWidget):
 
         self.inputs["filiaal"] = QComboBox()
         self.inputs["filiaal"].addItem("")
-        self.inputs["filiaal"].addItems(["1) Helmond", "2) Veghel", "3) Venray", "4) Venlo", "5) Breda"])
+        self.inputs["filiaal"].addItems(["1) Helmond", "2) Veghel", "3) Venray", "4) Venlo", "5) Breda", "x) Leverancier"])
         self.inputs["collega"] = QLineEdit()
 
         filiaal_collega_widget = QWidget()
@@ -1076,7 +1076,7 @@ class MainWindow(QWidget):
         info.setObjectName("HintText")
         lay.addWidget(info)
 
-        credit = QLabel("© 2026 Alexander Brinkman. Alle rechten voorbehouden. V1.0.2.0")
+        credit = QLabel("© 2026 Alexander Brinkman. Alle rechten voorbehouden. V1.1.0.0")
         credit.setObjectName("FooterCredit")
         credit.setAlignment(Qt.AlignRight)
         lay.addWidget(credit)
@@ -1216,7 +1216,7 @@ class MainWindow(QWidget):
         else:
             QMessageBox.information(self, "Succes", "Opgeslagen!")
 
-            
+
     # =========================================================
     # REMINDERS
     # =========================================================
@@ -1708,7 +1708,7 @@ class MainWindow(QWidget):
 
         inputs["filiaal"] = QComboBox()
         inputs["filiaal"].addItem("")
-        inputs["filiaal"].addItems(["1) Helmond", "2) Veghel", "3) Venray", "4) Venlo", "5) Breda"])
+        inputs["filiaal"].addItems(["1) Helmond", "2) Veghel", "3) Venray", "4) Venlo", "5) Breda", "x) Leverancier"])
         index = inputs["filiaal"].findText(row_data[4])
         inputs["filiaal"].setCurrentIndex(index if index >= 0 else 0)
         inputs["collega"] = QLineEdit(row_data[5])
