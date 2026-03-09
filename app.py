@@ -4,6 +4,7 @@ import sqlite3
 import smtplib
 import json
 import re
+import html
 from email.message import EmailMessage
 from datetime import datetime, timedelta
 
@@ -17,7 +18,7 @@ from PySide6.QtCore import (
     QThreadPool,
     QStandardPaths,
 )
-from PySide6.QtGui import QAction, QColor
+from PySide6.QtGui import QAction, QColor, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -42,6 +43,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QStyledItemDelegate,
     QStyle,
+    QScrollArea,
 )
 
 
@@ -57,7 +59,10 @@ APP_PASSWORD = "jqfa pqxk rpgy lydx"
 APP_NAME = "IntersportApp"
 DB_FILENAME = "store.db"
 SETTINGS_FILENAME = "settings.json"
-QSS_FILE = "intersport.qss"
+INTERSPORT_QSS_FILE = "intersport.qss"
+SPORTSTORE_QSS_FILE = "Sportstore.qss"
+INTERSPORT_LOGO_FILE = "KOBALT ZONDER PLAATSNAAM.png"
+SPORTSTORE_LOGO_FILE = "Sportstore Kobalt blauw.png"
 
 REMINDER_AFTER_DAYS = 7
 REMINDER_REPEAT_DAYS = 7
@@ -105,15 +110,19 @@ def _normalize_phone(raw: str) -> str | None:
     if not s:
         return None
 
+    s_no_spaces = re.sub(r"\s+", "", s)
     digits = re.sub(r"\D", "", s)
 
-    # 06 + 8 digits => 10 digits total
+    # Nederlands mobiel: 06XXXXXXXX -> +316XXXXXXXX
     if digits.startswith("06") and len(digits) == 10:
-        return digits
+        return "+31" + digits[1:]
 
-    # +316 + 8 digits => "316" + 8 digits = 11 digits; require input to start with +316
-    s_no_spaces = re.sub(r"\s+", "", s)
+    # Nederlands mobiel al in E.164: +316XXXXXXXX
     if s_no_spaces.startswith("+316") and digits.startswith("316") and len(digits) == 11:
+        return "+" + digits
+
+    # Internationaal nummer in E.164-formaat: + gevolgd door 8 t/m 15 cijfers
+    if s_no_spaces.startswith("+") and 8 <= len(digits) <= 15:
         return "+" + digits
 
     return None
@@ -339,7 +348,13 @@ def add_request(data):
 
 def get_all_requests():
     with connect() as conn:
-        return conn.execute(f"SELECT {REQUEST_COLUMNS} FROM requests ORDER BY id DESC").fetchall()
+        open_rows = conn.execute(
+            f"SELECT {REQUEST_COLUMNS} FROM requests WHERE afgerond=0 ORDER BY id DESC"
+        ).fetchall()
+        done_rows = conn.execute(
+            f"SELECT {REQUEST_COLUMNS} FROM requests WHERE afgerond=1 ORDER BY id DESC LIMIT 25"
+        ).fetchall()
+        return list(open_rows) + list(done_rows)
 
 
 def get_request_by_id(row_id: int):
@@ -375,6 +390,15 @@ def set_setting(key, value):
     settings = load_settings()
     settings[key] = value
     save_settings(settings)
+
+
+def get_active_theme() -> str:
+    theme = str(get_setting("style_theme") or "Intersport").strip()
+    return theme if theme in ("Intersport", "Sportstore") else "Intersport"
+
+
+def get_active_qss_file() -> str:
+    return SPORTSTORE_QSS_FILE if get_active_theme() == "Sportstore" else INTERSPORT_QSS_FILE
 
 
 # ------------------------
@@ -425,16 +449,100 @@ def send_test_email(receiver):
         server.send_message(msg)
 
 
-def send_customer_arrival_email(receiver_email: str):
+def send_customer_arrival_email(request_row):
     _require_email_password()
+
+    def _get_active_brand():
+        theme = get_active_theme()
+        return "SPORTSTORE" if theme == "Sportstore" else "INTERSPORT"
+
+    brand_name = _get_active_brand()
+    receiver_email = (request_row["email"] or "").strip()
+    verkoper = (request_row["verkoper"] or "").strip()
+
+    if not receiver_email:
+        raise RuntimeError("Geen e-mailadres gevonden voor deze klant.")
+
+    logo_filename = SPORTSTORE_LOGO_FILE if get_active_theme() == "Sportstore" else INTERSPORT_LOGO_FILE
+
+    logo_path = resource_path(logo_filename)
+    logo_cid = "brandlogo"
+
+    subject = f"Uw bestelling is binnen bij {brand_name}"
+
+    text_body = (
+        f"Beste {request_row['klantnaam'] or 'klant'},\n\n"
+        "Het artikel dat u bij ons in de winkel besteld hebt, is zojuist bij ons aangekomen.\n"
+        "U kunt het op elk gewenst moment komen ophalen bij ons in de winkel.\n\n"
+        f"Met sportieve groeten,\n{verkoper}"
+    )
+
+    klant_naam = html.escape((request_row["klantnaam"] or "klant").strip())
+    verkoper_html = html.escape(verkoper)
+
+    html_body = f"""\
+<html>
+  <body style="margin:0; padding:0; background-color:#f4f6f8; font-family:Arial, Helvetica, sans-serif; color:#1f2937;">
+    <div style="max-width:720px; margin:0 auto; padding:32px 20px;">
+      <div style="background:#ffffff; border:1px solid #e5e7eb; border-radius:14px; overflow:hidden;">
+        <div style="padding:24px 24px 10px 24px; text-align:left;">
+          <img src="cid:{logo_cid}" alt="{brand_name} logo" style="max-width:260px; max-height:70px; height:auto; width:auto;">
+        </div>
+
+        <div style="padding:8px 24px 28px 24px;">
+          <h1 style="margin:0 0 18px 0; font-size:24px; line-height:1.3; color:#163e96;">
+            Uw bestelling is binnen
+          </h1>
+
+          <p style="margin:0 0 14px 0; font-size:15px; line-height:1.7;">
+            Beste {klant_naam},
+          </p>
+
+          <p style="margin:0 0 14px 0; font-size:15px; line-height:1.7;">
+            Het artikel dat u bij ons in de winkel besteld hebt, is zojuist bij ons aangekomen.
+          </p>
+
+          <p style="margin:0 0 20px 0; font-size:15px; line-height:1.7;">
+            U kunt het op elk gewenst moment komen ophalen bij ons in de winkel.
+          </p>
+
+          <p style="margin:24px 0 0 0; font-size:15px; line-height:1.7;">
+            Met sportieve groeten,<br>
+            <strong>{verkoper_html}</strong>
+          </p>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
+"""
+
     msg = EmailMessage()
-    msg["Subject"] = "Uw bestelling is binnen bij INTERSPORT"
+    msg["Subject"] = subject
     msg["From"] = SENDER_EMAIL
     msg["To"] = receiver_email
-    msg.set_content(
-        "Het artikel dat u bij ons in de winkel besteld hebt, is zojuist bij ons aangekomen. "
-        "U kunt het op elk gewenst moment komen ophalen bij ons in de winkel."
-    )
+    msg.set_content(text_body)
+    msg.add_alternative(html_body, subtype="html")
+
+    if os.path.exists(logo_path):
+        with open(logo_path, "rb") as f:
+            logo_data = f.read()
+
+        if logo_path.lower().endswith(".png"):
+            maintype, subtype = "image", "png"
+        elif logo_path.lower().endswith(".jpg") or logo_path.lower().endswith(".jpeg"):
+            maintype, subtype = "image", "jpeg"
+        else:
+            maintype, subtype = "image", "png"
+
+        msg.get_payload()[-1].add_related(
+            logo_data,
+            maintype=maintype,
+            subtype=subtype,
+            cid=f"<{logo_cid}>",
+            filename=os.path.basename(logo_path),
+        )
+
     with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
         server.login(SENDER_EMAIL, APP_PASSWORD)
         server.send_message(msg)
@@ -469,6 +577,7 @@ class MainWindow(QWidget):
         super().__init__()
 
         self.threadpool = QThreadPool.globalInstance()
+        self._active_email_workers = []
         self._manual_reminders_in_progress = False
         self._auto_reminders_in_progress = False
 
@@ -508,11 +617,11 @@ class MainWindow(QWidget):
         lay.setContentsMargins(16, 12, 16, 12)
         lay.setSpacing(12)
 
-        badge = QLabel("INTERSPORT")
-        badge.setObjectName("BrandBadge")
-        badge.setAlignment(Qt.AlignCenter)
-        badge.setFixedHeight(34)
-        badge.setMinimumWidth(130)
+        self.brand_logo = QLabel()
+        self.brand_logo.setObjectName("BrandBadge")
+        self.brand_logo.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.brand_logo.setMinimumHeight(40)
+        self.brand_logo.setMinimumWidth(170)
 
         title = QLabel("Reminders Dashboard")
         title.setObjectName("HeaderTitle")
@@ -531,19 +640,57 @@ class MainWindow(QWidget):
 
         quick_refresh = QPushButton("Ververs")
         quick_refresh.setObjectName("BtnSecondary")
-        quick_refresh.setFixedHeight(34)
+        quick_refresh.setMinimumHeight(34)
         quick_refresh.clicked.connect(self.refresh_table)
 
-        lay.addWidget(badge)
+        lay.addWidget(self.brand_logo)
         lay.addLayout(text_col)
         lay.addWidget(spacer)
         lay.addWidget(quick_refresh)
         return bar
 
+
+    def _get_active_logo_file(self) -> str | None:
+        theme = get_active_theme()
+        candidates = []
+        if theme == "Sportstore":
+            candidates = [SPORTSTORE_LOGO_FILE, INTERSPORT_LOGO_FILE]
+        else:
+            candidates = [INTERSPORT_LOGO_FILE, SPORTSTORE_LOGO_FILE]
+
+        for filename in candidates:
+            full_path = resource_path(filename)
+            if os.path.exists(full_path):
+                return full_path
+        return None
+
+    def update_branding(self):
+        logo_path = self._get_active_logo_file()
+        theme = get_active_theme()
+
+        if logo_path:
+            pixmap = QPixmap(logo_path)
+            if not pixmap.isNull():
+                scaled = pixmap.scaledToHeight(40, Qt.SmoothTransformation)
+                self.brand_logo.setPixmap(scaled)
+                self.brand_logo.setText("")
+                return
+
+        self.brand_logo.setPixmap(QPixmap())
+        self.brand_logo.setText(theme.upper())
+
     # =========================================================
     # TAB 1: FORM
     # =========================================================
     def create_form_tab(self):
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
         widget = QWidget()
         outer = QVBoxLayout(widget)
         outer.setContentsMargins(18, 18, 18, 18)
@@ -580,7 +727,7 @@ class MainWindow(QWidget):
         self.inputs["prijs"] = QLineEdit()
 
         self.inputs["opmerking"].setPlaceholderText("Bijv. maat / kleur / levertijd / actie...")
-        self.inputs["email"].setPlaceholderText("optioneel (e-mail of 06 / +316 nummer)")
+        self.inputs["email"].setPlaceholderText("bijv. naam@domein.nl, 0612345678 of +48123456789")
         self.inputs["prijs"].setPlaceholderText("bijv. 129,95")
         self.inputs["ean"].setPlaceholderText("bijv. 8712345678901")
 
@@ -634,15 +781,19 @@ class MainWindow(QWidget):
 
         add_btn = QPushButton("Opslaan")
         add_btn.setObjectName("BtnPrimary")
-        add_btn.setFixedHeight(38)
+        add_btn.setMinimumHeight(38)
         add_btn.clicked.connect(self.handle_add)
 
         btn_row.addWidget(add_btn)
         card_lay.addLayout(btn_row)
 
         outer.addWidget(card)
-        outer.addStretch(1)
-        return widget
+        outer.addStretch()
+
+        scroll.setWidget(widget)
+        container_layout.addWidget(scroll)
+
+        return container
 
     # =========================================================
     # TAB 2: DASHBOARD
@@ -666,7 +817,7 @@ class MainWindow(QWidget):
 
         self.manual_send_btn = QPushButton("Verstuur reminders nu")
         self.manual_send_btn.setObjectName("BtnDanger")
-        self.manual_send_btn.setFixedHeight(36)
+        self.manual_send_btn.setMinimumHeight(36)
         self.manual_send_btn.clicked.connect(self.send_all_reminders_manual)
 
         top_row.addWidget(self.manual_send_btn)
@@ -792,6 +943,12 @@ class MainWindow(QWidget):
         self.test_email_input.setText(get_setting("reminder_email"))
         form.addRow("Test e-mail naar", self.test_email_input)
 
+        self.style_theme_input = QComboBox()
+        self.style_theme_input.addItems(["Intersport", "Sportstore"])
+        current_theme = self.style_theme_input.findText(get_active_theme())
+        self.style_theme_input.setCurrentIndex(current_theme if current_theme >= 0 else 0)
+        form.addRow("Opmaak versie", self.style_theme_input)
+
         lay.addLayout(form)
 
         btns = QHBoxLayout()
@@ -799,12 +956,12 @@ class MainWindow(QWidget):
 
         self.test_btn = QPushButton("Verstuur test e-mail")
         self.test_btn.setObjectName("BtnSecondary")
-        self.test_btn.setFixedHeight(36)
+        self.test_btn.setMinimumHeight(36)
         self.test_btn.clicked.connect(self.handle_send_test_email)
 
         save_btn = QPushButton("Opslaan")
         save_btn.setObjectName("BtnPrimary")
-        save_btn.setFixedHeight(36)
+        save_btn.setMinimumHeight(36)
         save_btn.clicked.connect(self.save_settings)
 
         btns.addWidget(self.test_btn)
@@ -826,10 +983,16 @@ class MainWindow(QWidget):
 
     def save_settings(self):
         email = self.reminder_email_input.text().strip()
+        theme = self.style_theme_input.currentText().strip() or "Intersport"
+
         set_setting("reminder_email", email)
+        set_setting("style_theme", theme)
+
         if not self.test_email_input.text().strip():
             self.test_email_input.setText(email)
-        QMessageBox.information(self, "Succes", "Email opgeslagen!")
+
+        self.load_styles()
+        QMessageBox.information(self, "Succes", "Instellingen opgeslagen!")
 
     def handle_send_test_email(self):
         receiver = self.test_email_input.text().strip() or self.reminder_email_input.text().strip()
@@ -947,28 +1110,100 @@ class MainWindow(QWidget):
         if not receiver:
             raise RuntimeError("Geen reminder e-mail ingesteld in Instellingen.")
 
-        klant = request_row["klantnaam"]
-        opmerking = request_row["opmerking"]
-        verkoper = request_row["verkoper"]
-        created_at = request_row["created_at"]
+        klant = (request_row["klantnaam"] or "").strip()
+        verkoper = (request_row["verkoper"] or "").strip()
+        contact = (request_row["email"] or "").strip()
+        bestelling = (request_row["opmerking"] or "").strip()
+        productcode = (request_row["productcode"] or "").strip()
+        eancode = (request_row["eancode"] or "").strip()
+        created_at = (request_row["created_at"] or "").strip()
         row_id = request_row["id"]
 
+        # Mooier weergeven van datum/tijd als dat lukt
+        created_display = created_at
+        try:
+            created_display = datetime.fromisoformat(created_at).strftime("%d-%m-%Y %H:%M")
+        except Exception:
+            pass
+
+        subject = f"Reminder: bestelling van {klant} staat nog open"
+
+        text_body = (
+            "Beste collega,\n\n"
+            "Er staat een bestelling/verzoek langer dan 7 dagen open.\n\n"
+            "Overzicht van de bestelling:\n"
+            f"- Klantnaam: {klant}\n"
+            f"- Verkoper: {verkoper}\n"
+            f"- E-mail of telefoonnummer: {contact}\n"
+            f"- Bestelling / opmerking: {bestelling}\n"
+            f"- Productcode: {productcode}\n"
+            f"- EAN-code: {eancode}\n"
+            f"- Aangemaakt op: {created_display}\n\n"
+            "Wil je deze bestelling controleren en indien mogelijk afronden?"
+        )
+
+        html_body = f"""
+        <html>
+        <body style="margin:0; padding:0; background-color:#f4f6f8; font-family:Arial, Helvetica, sans-serif; color:#1f2937;">
+            <div style="max-width:720px; margin:0 auto; padding:32px 20px;">
+            <div style="background:#ffffff; border-radius:14px; overflow:hidden; border:1px solid #e5e7eb;">
+                <div style="background:#1e3a8a; padding:20px 24px;">
+                <h1 style="margin:0; font-size:22px; line-height:1.3; color:#ffffff;">Reminder openstaande bestelling</h1>
+                </div>
+
+                <div style="padding:24px;">
+                <p style="margin:0 0 16px 0; font-size:15px;">Beste collega,</p>
+                <p style="margin:0 0 20px 0; font-size:15px; line-height:1.6;">
+                    Er staat een bestelling/verzoek langer dan 7 dagen open. Hieronder vind je een overzicht van alle verplichte velden van deze entry.
+                </p>
+
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse; margin:0 0 20px 0;">
+                    <tr>
+                    <td style="padding:12px 14px; background:#f9fafb; border:1px solid #e5e7eb; font-weight:bold;">Klantnaam</td>
+                    <td style="padding:12px 14px; background:#ffffff; border:1px solid #e5e7eb;">{klant}</td>
+                    </tr>
+                    <tr>
+                    <td style="padding:12px 14px; background:#f9fafb; border:1px solid #e5e7eb; font-weight:bold;">Verkoper</td>
+                    <td style="padding:12px 14px; background:#ffffff; border:1px solid #e5e7eb;">{verkoper}</td>
+                    </tr>
+                    <tr>
+                    <td style="padding:12px 14px; background:#f9fafb; border:1px solid #e5e7eb; font-weight:bold;">E-mail of telefoonnummer</td>
+                    <td style="padding:12px 14px; background:#ffffff; border:1px solid #e5e7eb;">{contact}</td>
+                    </tr>
+                    <tr>
+                    <td style="padding:12px 14px; background:#f9fafb; border:1px solid #e5e7eb; font-weight:bold;">Bestelling / opmerking</td>
+                    <td style="padding:12px 14px; background:#ffffff; border:1px solid #e5e7eb;">{bestelling}</td>
+                    </tr>
+                    <tr>
+                    <td style="padding:12px 14px; background:#f9fafb; border:1px solid #e5e7eb; font-weight:bold;">Productcode</td>
+                    <td style="padding:12px 14px; background:#ffffff; border:1px solid #e5e7eb;">{productcode}</td>
+                    </tr>
+                    <tr>
+                    <td style="padding:12px 14px; background:#f9fafb; border:1px solid #e5e7eb; font-weight:bold;">EAN-code</td>
+                    <td style="padding:12px 14px; background:#ffffff; border:1px solid #e5e7eb;">{eancode}</td>
+                    </tr>
+                    <tr>
+                    <td style="padding:12px 14px; background:#f9fafb; border:1px solid #e5e7eb; font-weight:bold;">Aangemaakt op</td>
+                    <td style="padding:12px 14px; background:#ffffff; border:1px solid #e5e7eb;">{created_display}</td>
+                    </tr>
+                </table>
+
+                <p style="margin:0 0 18px 0; font-size:15px; line-height:1.6;">
+                    Wil je deze bestelling controleren en indien mogelijk afronden?
+                </p>
+                </div>
+            </div>
+            </div>
+        </body>
+        </html>
+        """
+
         msg = EmailMessage()
-        msg["Subject"] = f"INTERSPORT reminder: bestelling {klant} nog open"
+        msg["Subject"] = subject
         msg["From"] = SENDER_EMAIL
         msg["To"] = receiver
-        msg.set_content(
-            "Beste collega,\n\n"
-            "Deze bestelling/verzoek staat langer dan 7 dagen open:\n\n"
-            f"ID: {row_id}\n"
-            f"Klant: {klant}\n"
-            f"bestelling: {opmerking}\n"
-            f"Verkoper: {verkoper}\n"
-            f"Aangemaakt op: {created_at}\n\n"
-            "Wil je dit item controleren en (indien mogelijk) afronden?\n\n"
-            "Met sportieve groet,\n"
-            "INTERSPORT Reminders"
-        )
+        msg.set_content(text_body)
+        msg.add_alternative(html_body, subtype="html")
 
         _require_email_password()
         with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
@@ -1203,13 +1438,30 @@ class MainWindow(QWidget):
             return
 
         if is_email(contact_value):
-            worker = EmailWorker(send_customer_arrival_email, contact_value)
+            worker = EmailWorker(send_customer_arrival_email, row)
+            self._active_email_workers.append(worker)
+
+            def _cleanup():
+                try:
+                    self._active_email_workers.remove(worker)
+                except ValueError:
+                    pass
 
             def _ok(_):
-                QMessageBox.information(self, "Bericht verzonden", f"Automatische e-mail is verzonden naar:\n{contact_value}")
+                _cleanup()
+                QMessageBox.information(
+                    self,
+                    "Bericht verzonden",
+                    f"Automatische e-mail is verzonden naar:\n{contact_value}"
+                )
 
             def _err(msg: str):
-                QMessageBox.critical(self, "E-mail fout", f"De e-mail kon niet worden verzonden.\n\nReden:\n{msg}")
+                _cleanup()
+                QMessageBox.critical(
+                    self,
+                    "E-mail fout",
+                    f"De e-mail kon niet worden verzonden.\n\nReden:\n{msg}"
+                )
 
             worker.signals.finished.connect(_ok)
             worker.signals.error.connect(_err)
@@ -1301,7 +1553,7 @@ class MainWindow(QWidget):
             if key == "opmerking":
                 line.setMaximumWidth(560)
             if key == "email":
-                line.setPlaceholderText("optioneel (e-mail of 06 / +316 nummer)")
+                line.setPlaceholderText("bijv. naam@domein.nl, 0612345678 of +48123456789")
             layout.addRow(label, line)
             inputs[key] = line
 
@@ -1431,7 +1683,8 @@ class MainWindow(QWidget):
     # STYLING
     # =========================================================
     def load_styles(self):
-        qss_path = resource_path(QSS_FILE)
+        self.update_branding()
+        qss_path = resource_path(get_active_qss_file())
         if os.path.exists(qss_path):
             try:
                 with open(qss_path, "r", encoding="utf-8") as f:
@@ -1439,6 +1692,15 @@ class MainWindow(QWidget):
                 return
             except Exception as e:
                 print(f"[STYLE] Could not load {qss_path}: {e}")
+
+        fallback_qss_path = resource_path(INTERSPORT_QSS_FILE)
+        if os.path.exists(fallback_qss_path):
+            try:
+                with open(fallback_qss_path, "r", encoding="utf-8") as f:
+                    self.setStyleSheet(f.read())
+                return
+            except Exception as e:
+                print(f"[STYLE] Could not load fallback {fallback_qss_path}: {e}")
 
         # fallback
         self.setStyleSheet(
