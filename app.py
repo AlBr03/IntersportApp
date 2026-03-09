@@ -332,7 +332,7 @@ def init_db():
 
 def add_request(data):
     with connect() as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO requests (
                 klantnaam, verkoper, email, opmerking,
@@ -344,6 +344,7 @@ def add_request(data):
             """,
             data,
         )
+        return cursor.lastrowid
 
 
 def get_all_requests():
@@ -504,6 +505,109 @@ def send_customer_arrival_email(request_row):
 
           <p style="margin:0 0 20px 0; font-size:15px; line-height:1.7;">
             U kunt het op elk gewenst moment komen ophalen bij ons in de winkel.
+          </p>
+
+          <p style="margin:24px 0 0 0; font-size:15px; line-height:1.7;">
+            Met sportieve groeten,<br>
+            <strong>{verkoper_html}</strong>
+          </p>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
+"""
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = receiver_email
+    msg.set_content(text_body)
+    msg.add_alternative(html_body, subtype="html")
+
+    if os.path.exists(logo_path):
+        with open(logo_path, "rb") as f:
+            logo_data = f.read()
+
+        if logo_path.lower().endswith(".png"):
+            maintype, subtype = "image", "png"
+        elif logo_path.lower().endswith(".jpg") or logo_path.lower().endswith(".jpeg"):
+            maintype, subtype = "image", "jpeg"
+        else:
+            maintype, subtype = "image", "png"
+
+        msg.get_payload()[-1].add_related(
+            logo_data,
+            maintype=maintype,
+            subtype=subtype,
+            cid=f"<{logo_cid}>",
+            filename=os.path.basename(logo_path),
+        )
+
+    with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+        server.login(SENDER_EMAIL, APP_PASSWORD)
+        server.send_message(msg)
+
+def send_customer_confirmation_email(request_row):
+    _require_email_password()
+
+    def _get_active_brand():
+        theme = get_active_theme()
+        return "SPORTSTORE" if theme == "Sportstore" else "INTERSPORT"
+
+    brand_name = _get_active_brand()
+    receiver_email = (request_row["email"] or "").strip()
+    verkoper = (request_row["verkoper"] or "").strip()
+
+    if not receiver_email:
+        raise RuntimeError("Geen e-mailadres gevonden voor deze klant.")
+
+    logo_filename = SPORTSTORE_LOGO_FILE if get_active_theme() == "Sportstore" else INTERSPORT_LOGO_FILE
+
+    logo_path = resource_path(logo_filename)
+    logo_cid = "brandlogo"
+
+    subject = f"Bedankt voor uw bestelling bij {brand_name}"
+
+    text_body = (
+        f"Beste {request_row['klantnaam'] or 'klant'},\n\n"
+        "Wij zijn erg dankbaar dat u hebt gekozen voor het winkelen bij uw lokale ondernemer. "
+        "Wij gaan direct aan de slag om uw bestelling zo spoedig en goed mogelijk af te ronden. "
+        "Wij laten u direct iets weten zodra uw bestelling bij ons binnen is!\n\n"
+        f"Met sportieve groeten,\n{verkoper}"
+    )
+
+    klant_naam = html.escape((request_row["klantnaam"] or "klant").strip())
+    verkoper_html = html.escape(verkoper)
+
+    html_body = f"""\
+<html>
+  <body style="margin:0; padding:0; background-color:#f4f6f8; font-family:Arial, Helvetica, sans-serif; color:#1f2937;">
+    <div style="max-width:720px; margin:0 auto; padding:32px 20px;">
+      <div style="background:#ffffff; border:1px solid #e5e7eb; border-radius:14px; overflow:hidden;">
+        <div style="padding:24px 24px 10px 24px; text-align:left;">
+          <img src="cid:{logo_cid}" alt="{brand_name} logo" style="max-width:260px; max-height:70px; height:auto; width:auto;">
+        </div>
+
+        <div style="padding:8px 24px 28px 24px;">
+          <h1 style="margin:0 0 18px 0; font-size:24px; line-height:1.3; color:#163e96;">
+            Bedankt voor uw bestelling
+          </h1>
+
+          <p style="margin:0 0 14px 0; font-size:15px; line-height:1.7;">
+            Beste {klant_naam},
+          </p>
+
+          <p style="margin:0 0 14px 0; font-size:15px; line-height:1.7;">
+            Wij zijn erg dankbaar dat u hebt gekozen voor het winkelen bij uw lokale ondernemer.
+          </p>
+
+          <p style="margin:0 0 14px 0; font-size:15px; line-height:1.7;">
+            Wij gaan direct aan de slag om uw bestelling zo spoedig en goed mogelijk af te ronden.
+          </p>
+
+          <p style="margin:0 0 20px 0; font-size:15px; line-height:1.7;">
+            Wij laten u direct iets weten zodra uw bestelling bij ons binnen is!
           </p>
 
           <p style="margin:24px 0 0 0; font-size:15px; line-height:1.7;">
@@ -1068,8 +1172,8 @@ class MainWindow(QWidget):
             _dt_str(datetime.now()),
         )
 
-        add_request(data)
-        QMessageBox.information(self, "Succes", "Opgeslagen!")
+        new_row_id = add_request(data)
+        new_row = get_request_by_id(new_row_id)
 
         for _, w in self.inputs.items():
             if isinstance(w, QLineEdit):
@@ -1080,6 +1184,39 @@ class MainWindow(QWidget):
         self.refresh_table()
         self.tabs.setCurrentIndex(1)
 
+        if new_row and is_email(normalized_contact):
+            worker = EmailWorker(send_customer_confirmation_email, new_row)
+            self._active_email_workers.append(worker)
+
+            def _cleanup():
+                try:
+                    self._active_email_workers.remove(worker)
+                except ValueError:
+                    pass
+
+            def _ok(_):
+                _cleanup()
+                QMessageBox.information(
+                    self,
+                    "Succes",
+                    f"Opgeslagen!\n\nAutomatische e-mail is verzonden naar:\n{normalized_contact}"
+                )
+
+            def _err(msg: str):
+                _cleanup()
+                QMessageBox.warning(
+                    self,
+                    "Opgeslagen, maar e-mail mislukt",
+                    f"De entry is opgeslagen, maar de automatische e-mail kon niet worden verzonden.\n\nReden:\n{msg}"
+                )
+
+            worker.signals.finished.connect(_ok)
+            worker.signals.error.connect(_err)
+            self.threadpool.start(worker)
+        else:
+            QMessageBox.information(self, "Succes", "Opgeslagen!")
+
+            
     # =========================================================
     # REMINDERS
     # =========================================================
