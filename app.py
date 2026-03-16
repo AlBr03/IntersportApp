@@ -62,7 +62,7 @@ SETTINGS_FILENAME = "settings.json"
 INTERSPORT_QSS_FILE = "intersport.qss"
 SPORTSTORE_QSS_FILE = "Sportstore.qss"
 INTERSPORT_LOGO_FILE = "KOBALT ZONDER PLAATSNAAM.png"
-SPORTSTORE_LOGO_FILE = "Sportstore Kobalt blauw.png"
+SPORTSTORE_LOGO_FILE = "Sportstore kobalt.png"
 
 REMINDER_AFTER_DAYS = 7
 REMINDER_REPEAT_DAYS = 7
@@ -473,8 +473,8 @@ def send_customer_arrival_email(request_row):
 
     text_body = (
         f"Beste {request_row['klantnaam'] or 'klant'},\n\n"
-        "Het artikel dat u bij ons in de winkel besteld hebt, is zojuist bij ons aangekomen.\n"
-        "U kunt het op elk gewenst moment komen ophalen bij ons in de winkel.\n\n"
+        "Goed nieuws! Het artikel dat u bij ons heeft besteld, is zojuist bij ons in de winkel aangekomen.\n"
+        "Uw bestelling ligt voor u klaar en kan op elk gewenst moment tijdens onze openingstijden worden opgehaald. Wij helpen u graag verder wanneer u langskomt.\n\n"
         f"Met sportieve groeten,\n{verkoper}"
     )
 
@@ -500,11 +500,11 @@ def send_customer_arrival_email(request_row):
           </p>
 
           <p style="margin:0 0 14px 0; font-size:15px; line-height:1.7;">
-            Het artikel dat u bij ons in de winkel besteld hebt, is zojuist bij ons aangekomen.
+            Goed nieuws! Het artikel dat u bij ons heeft besteld, is zojuist bij ons in de winkel aangekomen.
           </p>
 
           <p style="margin:0 0 20px 0; font-size:15px; line-height:1.7;">
-            U kunt het op elk gewenst moment komen ophalen bij ons in de winkel.
+            Uw bestelling ligt voor u klaar en kan op elk gewenst moment tijdens onze openingstijden worden opgehaald. Wij helpen u graag verder wanneer u langskomt.
           </p>
 
           <p style="margin:24px 0 0 0; font-size:15px; line-height:1.7;">
@@ -571,9 +571,9 @@ def send_customer_confirmation_email(request_row):
 
     text_body = (
         f"Beste {request_row['klantnaam'] or 'klant'},\n\n"
-        "Wij zijn erg dankbaar dat u hebt gekozen voor het winkelen bij uw lokale ondernemer. "
-        "Wij gaan direct aan de slag om uw bestelling zo spoedig en goed mogelijk af te ronden. "
-        "Wij laten u direct iets weten zodra uw bestelling bij ons binnen is!\n\n"
+        "Hartelijk dank voor uw bestelling en voor het steunen van uw lokale ondernemer."
+        "Wij gaan direct aan de slag om uw bestelling zo snel mogelijk voor u te verwerken.\n"
+        "Zodra uw bestelling bij ons binnen is, ontvangt u direct een bericht van ons.\n\n"
         f"Met sportieve groeten,\n{verkoper}"
     )
 
@@ -599,15 +599,15 @@ def send_customer_confirmation_email(request_row):
           </p>
 
           <p style="margin:0 0 14px 0; font-size:15px; line-height:1.7;">
-            Wij zijn erg dankbaar dat u hebt gekozen voor het winkelen bij uw lokale ondernemer.
+            Hartelijk dank voor uw bestelling en voor het steunen van uw lokale ondernemer.
           </p>
 
           <p style="margin:0 0 14px 0; font-size:15px; line-height:1.7;">
-            Wij gaan direct aan de slag om uw bestelling zo spoedig en goed mogelijk af te ronden.
+            Wij gaan direct aan de slag om uw bestelling zo snel mogelijk voor u te verwerken.
           </p>
 
           <p style="margin:0 0 20px 0; font-size:15px; line-height:1.7;">
-            Wij laten u direct iets weten zodra uw bestelling bij ons binnen is!
+            Zodra uw bestelling bij ons binnen is, ontvangt u direct een bericht van ons.
           </p>
 
           <p style="margin:24px 0 0 0; font-size:15px; line-height:1.7;">
