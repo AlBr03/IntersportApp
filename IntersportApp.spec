@@ -5,7 +5,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('intersport.qss', '.'), ('Sportstore.qss', '.'), ('KOBALT ZONDER PLAATSNAAM.png', '.'), ('Sportstore Kobalt blauw.png', '.')],
+    datas=[('intersport.qss', '.'), ('Sportstore.qss', '.'), ('Sportstore kobalt.png', '.'), ('KOBALT ZONDER PLAATSNAAM.png', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

@@ -1076,7 +1076,7 @@ class MainWindow(QWidget):
         info.setObjectName("HintText")
         lay.addWidget(info)
 
-        credit = QLabel("© 2026 Alexander Brinkman. Alle rechten voorbehouden. V1.1.0.0")
+        credit = QLabel("© 2026 Alexander Brinkman. Alle rechten voorbehouden. V1.1.1.0")
         credit.setObjectName("FooterCredit")
         credit.setAlignment(Qt.AlignRight)
         lay.addWidget(credit)
