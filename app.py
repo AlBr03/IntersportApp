@@ -121,6 +121,11 @@ def _normalize_phone(raw: str) -> str | None:
     if s_no_spaces.startswith("+316") and digits.startswith("316") and len(digits) == 11:
         return "+" + digits
 
+    # Nederlands vast nummer: accepteren, maar NIET omzetten naar +31
+    # Voorbeelden: 0101234567, 020 123 4567, 0413 121233, 077-1234567
+    if digits.startswith("0") and len(digits) == 10 and not digits.startswith("06"):
+        return s
+
     # Internationaal nummer in E.164-formaat: + gevolgd door 8 t/m 15 cijfers
     if s_no_spaces.startswith("+") and 8 <= len(digits) <= 15:
         return "+" + digits
@@ -145,10 +150,10 @@ def validate_email_or_phone(value: str) -> tuple[bool, str, str]:
         v,
         "Vul een geldig e-mailadres of telefoonnummer in.\n\n"
         "Toegestaan:\n"
-        "• leeg\n"
         "• e-mail (bijv. naam@domein.nl)\n"
-        "• 06XXXXXXXX (10 cijfers)\n"
-        "• +316XXXXXXXX (bijv. +31612345678)"
+        "• mobiel: 06XXXXXXXX of +316XXXXXXXX\n"
+        "• vast NL-nummer: bijv. 0413121233 of 0413 121233\n"
+        "• internationaal: + gevolgd door 8 t/m 15 cijfers"
     )
 
 
@@ -178,6 +183,7 @@ BESTELSTATUS_COLORS = {
     "Onderweg/Besteld": "#FFEB9C",
     "Onderweg/besteld": "#FFEB9C",
     "Op locatie": "#92D050",
+    "Opgehaald/Afgewikkeld": "#C6EFCE",
 }
 
 
@@ -277,7 +283,7 @@ class StatusColorDelegate(QStyledItemDelegate):
 # DATABASE
 # ------------------------
 REQUEST_COLUMNS = (
-    "id, klantnaam, verkoper, email, opmerking, filiaal, collega, contactstatus, betaalstatus, bestelstatus, "
+    "id, klantnaam, verkoper, email, opmerking, maat, filiaal, collega, contactstatus, betaalstatus, bestelstatus, "
     "productcode, eancode, adviesprijs, afgerond, created_at, reminder_last_sent_at"
 )
 
@@ -303,6 +309,7 @@ def init_db():
                 verkoper TEXT NOT NULL,
                 email TEXT NOT NULL,
                 opmerking TEXT NOT NULL,
+                maat TEXT,
                 filiaal TEXT,
                 collega TEXT,
                 contactstatus TEXT,
@@ -323,6 +330,9 @@ def init_db():
         if not _column_exists(conn, "requests", "collega"):
             conn.execute("ALTER TABLE requests ADD COLUMN collega TEXT")
 
+        if not _column_exists(conn, "requests", "maat"):
+            conn.execute("ALTER TABLE requests ADD COLUMN maat TEXT")
+
         if not _column_exists(conn, "requests", "reminder_last_sent_at"):
             conn.execute("ALTER TABLE requests ADD COLUMN reminder_last_sent_at TEXT")
 
@@ -335,12 +345,12 @@ def add_request(data):
         cursor = conn.execute(
             """
             INSERT INTO requests (
-                klantnaam, verkoper, email, opmerking,
+                klantnaam, verkoper, email, opmerking, maat,
                 filiaal, collega, contactstatus, betaalstatus,
                 bestelstatus, productcode, eancode, adviesprijs,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             data,
         )
@@ -548,6 +558,7 @@ def send_customer_arrival_email(request_row):
         server.login(SENDER_EMAIL, APP_PASSWORD)
         server.send_message(msg)
 
+
 def send_customer_confirmation_email(request_row):
     _require_email_password()
 
@@ -753,7 +764,6 @@ class MainWindow(QWidget):
         lay.addWidget(quick_refresh)
         return bar
 
-
     def _get_active_logo_file(self) -> str | None:
         theme = get_active_theme()
         candidates = []
@@ -826,12 +836,14 @@ class MainWindow(QWidget):
         self.inputs["verkoper"] = QLineEdit()
         self.inputs["email"] = QLineEdit()
         self.inputs["opmerking"] = QLineEdit()
+        self.inputs["maat"] = QLineEdit()
         self.inputs["product"] = QLineEdit()
         self.inputs["ean"] = QLineEdit()
         self.inputs["prijs"] = QLineEdit()
 
         self.inputs["opmerking"].setPlaceholderText("Bijv. maat / kleur / levertijd / actie...")
-        self.inputs["email"].setPlaceholderText("bijv. naam@domein.nl, 0612345678 of +48123456789")
+        self.inputs["maat"].setPlaceholderText("bijv. 42 / M / 140")
+        self.inputs["email"].setPlaceholderText("bijv. naam@domein.nl, 0612345678, 0413 121233 of +48123456789")
         self.inputs["prijs"].setPlaceholderText("bijv. 129,95")
         self.inputs["ean"].setPlaceholderText("bijv. 8712345678901")
 
@@ -839,6 +851,7 @@ class MainWindow(QWidget):
         form.addRow("Verkoper *", self.inputs["verkoper"])
         form.addRow("E-mail of Telefoonnummer *", self.inputs["email"])
         form.addRow("bestelling *", self.inputs["opmerking"])
+        form.addRow("Maat", self.inputs["maat"])
 
         product_ean_widget = QWidget()
         product_ean_layout = QHBoxLayout(product_ean_widget)
@@ -874,7 +887,7 @@ class MainWindow(QWidget):
         apply_combo_colors(self.inputs["betaalstatus"], BETAALSTATUS_COLORS)
 
         self.inputs["bestelstatus"] = QComboBox()
-        self.inputs["bestelstatus"].addItems(["Nog opvragen/bestellen", "Onderweg/Besteld", "Op locatie"])
+        self.inputs["bestelstatus"].addItems(["Nog opvragen/bestellen", "Onderweg/Besteld", "Op locatie", "Opgehaald/Afgewikkeld"])
         form.addRow("Bestelstatus", self.inputs["bestelstatus"])
         apply_combo_colors(self.inputs["bestelstatus"], BESTELSTATUS_COLORS)
 
@@ -913,7 +926,7 @@ class MainWindow(QWidget):
 
         self.search = QLineEdit()
         self.search.setObjectName("SearchField")
-        self.search.setPlaceholderText("Zoeken (klant, product, EAN, bestelling, filiaal, verkoper...)")
+        self.search.setPlaceholderText("Zoeken (klant, product, EAN, maat, bestelling, filiaal, verkoper...)")
         self.search.textChanged.connect(self.filter_tables)
 
         top_row.addWidget(QLabel("Zoek:"))
@@ -1076,7 +1089,7 @@ class MainWindow(QWidget):
         info.setObjectName("HintText")
         lay.addWidget(info)
 
-        credit = QLabel("© 2026 Alexander Brinkman. Alle rechten voorbehouden. V1.1.1.0")
+        credit = QLabel("© 2026 Alexander Brinkman. Alle rechten voorbehouden. V1.1.2.0")
         credit.setObjectName("FooterCredit")
         credit.setAlignment(Qt.AlignRight)
         lay.addWidget(credit)
@@ -1131,6 +1144,7 @@ class MainWindow(QWidget):
         verkoper = self.inputs["verkoper"].text().strip()
         contact = self.inputs["email"].text().strip()
         opmerking = self.inputs["opmerking"].text().strip()
+        maat = self.inputs["maat"].text().strip()
         productcode = self.inputs["product"].text().strip()
         eancode = self.inputs["ean"].text().strip()
 
@@ -1161,6 +1175,7 @@ class MainWindow(QWidget):
             verkoper,
             normalized_contact,
             opmerking,
+            maat,
             self.inputs["filiaal"].currentText(),
             self.inputs["collega"].text().strip(),
             self.inputs["contactstatus"].currentText(),
@@ -1216,7 +1231,6 @@ class MainWindow(QWidget):
         else:
             QMessageBox.information(self, "Succes", "Opgeslagen!")
 
-
     # =========================================================
     # REMINDERS
     # =========================================================
@@ -1256,7 +1270,6 @@ class MainWindow(QWidget):
         created_at = (request_row["created_at"] or "").strip()
         row_id = request_row["id"]
 
-        # Mooier weergeven van datum/tijd als dat lukt
         created_display = created_at
         try:
             created_display = datetime.fromisoformat(created_at).strftime("%d-%m-%Y %H:%M")
@@ -1441,6 +1454,7 @@ class MainWindow(QWidget):
             "Verkoper",
             "E-mail/Telefoon",
             "Opmerking",
+            "Maat",
             "Filiaal",
             "Collega",
             "Contact",
@@ -1466,6 +1480,7 @@ class MainWindow(QWidget):
                 row["verkoper"],
                 row["email"],
                 row["opmerking"],
+                row["maat"],
                 row["filiaal"],
                 row["collega"],
                 row["contactstatus"],
@@ -1489,8 +1504,8 @@ class MainWindow(QWidget):
         hh.setSectionResizeMode(QHeaderView.Interactive)
 
         widths = {
-            0: 140, 1: 120, 2: 220, 3: 420, 4: 160, 5: 160,
-            6: 150, 7: 120, 8: 160, 9: 130, 10: 170, 11: 110, 12: 150, 13: 70,
+            0: 140, 1: 120, 2: 220, 3: 320, 4: 90, 5: 160, 6: 160,
+            7: 150, 8: 120, 9: 170, 10: 130, 11: 170, 12: 110, 13: 150, 14: 70,
         }
         for col, w in widths.items():
             if col < table.columnCount():
@@ -1684,18 +1699,19 @@ class MainWindow(QWidget):
             ("verkoper", 1, "Verkoper"),
             ("email", 2, "E-mail of Telefoonnummer"),
             ("opmerking", 3, "Bestelling"),
-            ("prijs", 11, "Adviesprijs"),
+            ("maat", 4, "Maat"),
+            ("prijs", 12, "Adviesprijs"),
         ]:
             line = QLineEdit(row_data[col_index])
             if key == "opmerking":
                 line.setMaximumWidth(560)
             if key == "email":
-                line.setPlaceholderText("bijv. naam@domein.nl, 0612345678 of +48123456789")
+                line.setPlaceholderText("bijv. naam@domein.nl, 0612345678, 0413 121233 of +48123456789")
             layout.addRow(label, line)
             inputs[key] = line
 
-        inputs["product"] = QLineEdit(row_data[9])
-        inputs["ean"] = QLineEdit(row_data[10])
+        inputs["product"] = QLineEdit(row_data[10])
+        inputs["ean"] = QLineEdit(row_data[11])
         inputs["ean"].setPlaceholderText("bijv. 8712345678901")
 
         product_ean_widget = QWidget()
@@ -1709,9 +1725,9 @@ class MainWindow(QWidget):
         inputs["filiaal"] = QComboBox()
         inputs["filiaal"].addItem("")
         inputs["filiaal"].addItems(["1) Helmond", "2) Veghel", "3) Venray", "4) Venlo", "5) Breda", "x) Leverancier"])
-        index = inputs["filiaal"].findText(row_data[4])
+        index = inputs["filiaal"].findText(row_data[5])
         inputs["filiaal"].setCurrentIndex(index if index >= 0 else 0)
-        inputs["collega"] = QLineEdit(row_data[5])
+        inputs["collega"] = QLineEdit(row_data[6])
 
         filiaal_collega_widget = QWidget()
         filiaal_collega_layout = QHBoxLayout(filiaal_collega_widget)
@@ -1723,21 +1739,21 @@ class MainWindow(QWidget):
 
         inputs["contactstatus"] = QComboBox()
         inputs["contactstatus"].addItems(["s.v.p. bellen", "Gebeld", "Bericht gestuurd", "niet bereikbaar/nog bellen"])
-        idx = inputs["contactstatus"].findText(row_data[6])
+        idx = inputs["contactstatus"].findText(row_data[7])
         inputs["contactstatus"].setCurrentIndex(idx if idx >= 0 else 0)
         layout.addRow("Contactstatus", inputs["contactstatus"])
         apply_combo_colors(inputs["contactstatus"], CONTACTSTATUS_COLORS)
 
         inputs["betaalstatus"] = QComboBox()
         inputs["betaalstatus"].addItems(["Niet betaald!", "Betaald", "Op factuur"])
-        idx = inputs["betaalstatus"].findText(row_data[7])
+        idx = inputs["betaalstatus"].findText(row_data[8])
         inputs["betaalstatus"].setCurrentIndex(idx if idx >= 0 else 0)
         layout.addRow("Betaalstatus", inputs["betaalstatus"])
         apply_combo_colors(inputs["betaalstatus"], BETAALSTATUS_COLORS)
 
         inputs["bestelstatus"] = QComboBox()
-        inputs["bestelstatus"].addItems(["Nog opvragen/bestellen", "Onderweg/Besteld", "Op locatie"])
-        idx = inputs["bestelstatus"].findText(row_data[8])
+        inputs["bestelstatus"].addItems(["Nog opvragen/bestellen", "Onderweg/Besteld", "Op locatie", "Opgehaald/Afgewikkeld"])
+        idx = inputs["bestelstatus"].findText(row_data[9])
         inputs["bestelstatus"].setCurrentIndex(idx if idx >= 0 else 0)
         layout.addRow("Bestelstatus", inputs["bestelstatus"])
         apply_combo_colors(inputs["bestelstatus"], BESTELSTATUS_COLORS)
@@ -1788,6 +1804,7 @@ class MainWindow(QWidget):
                 inputs["verkoper"].text().strip(),
                 normalized_contact,
                 inputs["opmerking"].text().strip(),
+                inputs["maat"].text().strip(),
                 inputs["filiaal"].currentText(),
                 inputs["collega"].text().strip(),
                 inputs["contactstatus"].currentText(),
@@ -1796,13 +1813,13 @@ class MainWindow(QWidget):
                 inputs["product"].text().strip(),
                 inputs["ean"].text().strip(),
                 prijs,
-                int(row_data[13]),  # ID
+                int(row_data[14]),
             )
 
             with connect() as conn:
                 conn.execute(
                     """UPDATE requests
-                       SET klantnaam=?, verkoper=?, email=?, opmerking=?,
+                       SET klantnaam=?, verkoper=?, email=?, opmerking=?, maat=?,
                            filiaal=?, collega=?, contactstatus=?, betaalstatus=?, bestelstatus=?,
                            productcode=?, eancode=?, adviesprijs=?
                        WHERE id=?""",
