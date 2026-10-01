@@ -5,6 +5,16 @@ import smtplib
 import json
 import re
 import html
+import ctypes
+import faulthandler
+import logging
+import math
+import tempfile
+import threading
+import traceback
+from pathlib import Path
+from contextlib import contextmanager
+from logging.handlers import RotatingFileHandler
 from email.message import EmailMessage
 from datetime import datetime, timedelta
 
@@ -12,13 +22,15 @@ from PySide6.QtCore import (
     Qt,
     QTimer,
     QSize,
+    QUrl,
     QObject,
     Signal,
     QRunnable,
     QThreadPool,
-    QStandardPaths,
+    QLockFile,
+    qInstallMessageHandler,
 )
-from PySide6.QtGui import QAction, QColor, QPixmap
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -57,6 +69,7 @@ SENDER_EMAIL = "intersportreminders@gmail.com"
 APP_PASSWORD = "jqfa pqxk rpgy lydx"
 
 APP_NAME = "IntersportApp"
+APP_VERSION = "1.1.3.0"
 DB_FILENAME = "store.db"
 SETTINGS_FILENAME = "settings.json"
 INTERSPORT_QSS_FILE = "intersport.qss"
@@ -67,17 +80,284 @@ SPORTSTORE_LOGO_FILE = "Sportstore kobalt.png"
 REMINDER_AFTER_DAYS = 7
 REMINDER_REPEAT_DAYS = 7
 AUTO_CHECK_EVERY_MS = 60 * 60 * 1000  # 1 hour
+REMINDER_HEARTBEAT_MS = 60 * 1000  # short timer survives sleep/resume more reliably
+DB_BUSY_TIMEOUT_MS = 3000
+EMAIL_TIMEOUT_SECONDS = 10
+EMAIL_QUOTA_COOLDOWN_HOURS = 24
+MAX_EMAIL_WORKERS = 3
+BACKUP_RETENTION = 7
+
+
+LOGGER = logging.getLogger(APP_NAME)
+_LOG_PATH = None
+_FAULT_LOG_STREAM = None
+_DATA_DIR_READY = False
+_MIGRATION_NOTICES = []
+_SETTINGS_LOCK = threading.RLock()
+
+
+class DataMigrationError(RuntimeError):
+    pass
+
+
+def _configure_diagnostics() -> Path:
+    """Create a persistent startup/crash log, with a temp-folder fallback."""
+    global _LOG_PATH, _FAULT_LOG_STREAM
+    if _LOG_PATH is not None:
+        return _LOG_PATH
+
+    candidates = [
+        _canonical_appdata_dir() / "logs",
+        Path(tempfile.gettempdir()) / APP_NAME / "logs",
+    ]
+    last_error = None
+    for directory in candidates:
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            log_path = directory / "IntersportApp.log"
+            handler = RotatingFileHandler(
+                log_path,
+                maxBytes=1_000_000,
+                backupCount=3,
+                encoding="utf-8",
+            )
+            handler.setFormatter(
+                logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+            )
+            LOGGER.setLevel(logging.INFO)
+            LOGGER.addHandler(handler)
+            LOGGER.propagate = False
+
+            fault_path = directory / "IntersportApp-crash.log"
+            _FAULT_LOG_STREAM = fault_path.open("a", encoding="utf-8")
+            faulthandler.enable(file=_FAULT_LOG_STREAM, all_threads=True)
+
+            _LOG_PATH = log_path
+            return log_path
+        except (OSError, RuntimeError) as exc:
+            last_error = exc
+
+    raise OSError(f"Diagnostisch logboek kon niet worden aangemaakt: {last_error}")
+
+
+def _qt_message_handler(_message_type, _context, message):
+    LOGGER.warning("Qt: %s", message)
+
+
+def _report_fatal_error(title: str, exc: BaseException):
+    LOGGER.critical("%s: %s", title, exc, exc_info=(type(exc), exc, exc.__traceback__))
+    log_path = str(_LOG_PATH or "niet beschikbaar")
+    message = (
+        f"{title}. De applicatie wordt afgesloten.\n\n"
+        f"Reden: {exc}\n\n"
+        f"Diagnostisch logboek: {log_path}"
+    )
+    try:
+        QMessageBox.critical(None, "IntersportApp kan niet starten", message)
+    except Exception:
+        pass
+
+
+def _unhandled_exception_hook(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    LOGGER.critical(
+        "Onverwachte fout:\n%s",
+        "".join(traceback.format_exception(exc_type, exc_value, exc_traceback)),
+    )
+    try:
+        QMessageBox.critical(
+            None,
+            "Onverwachte fout",
+            f"Er is een onverwachte fout opgetreden.\n\n"
+            f"Reden: {exc_value}\n\n"
+            f"Diagnostisch logboek: {_LOG_PATH or 'niet beschikbaar'}",
+        )
+    except Exception:
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+
+def _windows_package_family_name() -> str:
+    """Return the current MSIX package family, or an empty string when unpackaged."""
+    if os.name != "nt":
+        return ""
+
+    try:
+        get_family_name = ctypes.WinDLL("kernel32", use_last_error=True).GetCurrentPackageFamilyName
+        get_family_name.argtypes = [ctypes.POINTER(ctypes.c_uint32), ctypes.c_wchar_p]
+        get_family_name.restype = ctypes.c_long
+
+        length = ctypes.c_uint32(0)
+        result = get_family_name(ctypes.byref(length), None)
+        if result == 15700:  # APPMODEL_ERROR_NO_PACKAGE
+            return ""
+        if result != 122 or not length.value:  # ERROR_INSUFFICIENT_BUFFER
+            return ""
+
+        buffer = ctypes.create_unicode_buffer(length.value)
+        result = get_family_name(ctypes.byref(length), buffer)
+        return buffer.value if result == 0 else ""
+    except (AttributeError, OSError):
+        return ""
+
+
+def _canonical_appdata_dir() -> Path:
+    """Use MSIX LocalState when packaged and Local AppData otherwise."""
+    override = os.getenv("INTERSPORT_DATA_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+
+    local_appdata = Path(os.getenv("LOCALAPPDATA", os.getcwd()))
+    package_family = _windows_package_family_name()
+    if package_family:
+        return local_appdata / "Packages" / package_family / "LocalState" / APP_NAME
+    return local_appdata / APP_NAME
+
+
+def _legacy_data_dirs(target: Path) -> list[Path]:
+    """Known locations used by older unpackaged and virtualized MSIX releases."""
+    candidates = []
+    roaming = os.getenv("APPDATA", "").strip()
+    local = os.getenv("LOCALAPPDATA", "").strip()
+
+    if roaming:
+        candidates.append(Path(roaming) / APP_NAME)
+    if local:
+        local_path = Path(local)
+        candidates.append(local_path / APP_NAME)
+        packages_path = local_path / "Packages"
+        if packages_path.is_dir():
+            for package_path in packages_path.glob(f"{APP_NAME}_*"):
+                candidates.extend(
+                    [
+                        package_path / "LocalCache" / "Roaming" / APP_NAME,
+                        package_path / "LocalCache" / "Local" / APP_NAME,
+                        package_path / "RoamingState" / APP_NAME,
+                        package_path / "LocalState" / APP_NAME,
+                    ]
+                )
+
+    target_key = os.path.normcase(os.path.abspath(target))
+    unique = []
+    seen = {target_key}
+    for candidate in candidates:
+        key = os.path.normcase(os.path.abspath(candidate))
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def _valid_database(path: Path) -> bool:
+    conn = None
+    try:
+        uri = path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
+        result = conn.execute("PRAGMA quick_check").fetchone()
+        return bool(result) and result[0] == "ok"
+    except (OSError, sqlite3.Error, TypeError, IndexError):
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _migrate_database(source: Path, destination: Path):
+    temp_path = destination.with_name(f"{destination.name}.migrating-{os.getpid()}")
+    source_conn = None
+    destination_conn = None
+    try:
+        source_uri = source.resolve().as_uri() + "?mode=ro"
+        source_conn = sqlite3.connect(source_uri, uri=True, timeout=10)
+        destination_conn = sqlite3.connect(temp_path, timeout=10)
+        source_conn.backup(destination_conn)
+        destination_conn.commit()
+        destination_conn.close()
+        destination_conn = None
+        source_conn.close()
+        source_conn = None
+        if not destination.exists():
+            os.replace(temp_path, destination)
+    finally:
+        if destination_conn is not None:
+            destination_conn.close()
+        if source_conn is not None:
+            source_conn.close()
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _migrate_legacy_data(target: Path):
+    target.mkdir(parents=True, exist_ok=True)
+    legacy_dirs = _legacy_data_dirs(target)
+    LOGGER.info("Actieve gegevensmap: %s", target)
+
+    destination_db = target / DB_FILENAME
+    if not destination_db.exists():
+        database_candidates = [
+            path / DB_FILENAME
+            for path in legacy_dirs
+            if (path / DB_FILENAME).is_file()
+        ]
+        database_candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        LOGGER.info(
+            "Databasekandidaten: %s",
+            ", ".join(str(path) for path in database_candidates) or "geen",
+        )
+
+        migrated = False
+        failures = []
+        for source_db in database_candidates:
+            if not _valid_database(source_db):
+                LOGGER.warning("Ongeldige database overgeslagen: %s", source_db)
+                failures.append(f"{source_db} (ongeldige database)")
+                continue
+            try:
+                _migrate_database(source_db, destination_db)
+                LOGGER.info("Database gemigreerd vanuit %s", source_db)
+                _MIGRATION_NOTICES.append(f"Database gemigreerd vanuit {source_db}")
+                migrated = True
+                break
+            except (OSError, sqlite3.Error) as exc:
+                LOGGER.exception("Migratie mislukt vanuit %s", source_db)
+                failures.append(f"{source_db} ({exc})")
+
+        if database_candidates and not migrated:
+            raise DataMigrationError(
+                "Bestaande database gevonden, maar migratie is mislukt:\n" + "\n".join(failures)
+            )
+
+    destination_settings = target / SETTINGS_FILENAME
+    if not destination_settings.exists():
+        settings_candidates = [
+            path / SETTINGS_FILENAME
+            for path in legacy_dirs
+            if (path / SETTINGS_FILENAME).is_file()
+        ]
+        settings_candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        for source_settings in settings_candidates:
+            try:
+                with source_settings.open("r", encoding="utf-8") as source_file:
+                    settings = json.load(source_file)
+                _write_json_atomic(destination_settings, settings)
+                LOGGER.info("Instellingen gemigreerd vanuit %s", source_settings)
+                _MIGRATION_NOTICES.append(f"Instellingen gemigreerd vanuit {source_settings}")
+                break
+            except (OSError, json.JSONDecodeError, TypeError):
+                continue
 
 
 def _appdata_dir() -> str:
-    """
-    Writable dir (works under MSIX too).
-    """
-    base = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
-    if not base:
-        base = os.path.join(os.getenv("LOCALAPPDATA", os.getcwd()), APP_NAME)
-    os.makedirs(base, exist_ok=True)
-    return base
+    global _DATA_DIR_READY
+    target = _canonical_appdata_dir()
+    if not _DATA_DIR_READY:
+        _migrate_legacy_data(target)
+        _DATA_DIR_READY = True
+    else:
+        target.mkdir(parents=True, exist_ok=True)
+    return str(target)
 
 
 def _db_path() -> str:
@@ -289,18 +569,24 @@ REQUEST_COLUMNS = (
 
 
 def connect():
-    conn = sqlite3.connect(_db_path())
+    conn = sqlite3.connect(_db_path(), timeout=DB_BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     return conn
 
 
-def _column_exists(conn, table_name: str, column_name: str) -> bool:
-    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return any((r["name"] if isinstance(r, sqlite3.Row) else r[1]) == column_name for r in rows)
+@contextmanager
+def db_connection():
+    conn = connect()
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db():
-    with connect() as conn:
+    with db_connection() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS requests (
@@ -324,24 +610,88 @@ def init_db():
             """
         )
 
-        if not _column_exists(conn, "requests", "eancode"):
-            conn.execute("ALTER TABLE requests ADD COLUMN eancode TEXT")
+        existing_columns = {
+            row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            for row in conn.execute("PRAGMA table_info(requests)").fetchall()
+        }
+        if "id" not in existing_columns:
+            raise DataMigrationError("De tabel requests heeft geen geldige id-kolom.")
 
-        if not _column_exists(conn, "requests", "collega"):
-            conn.execute("ALTER TABLE requests ADD COLUMN collega TEXT")
+        expected_columns = {
+            "klantnaam": "TEXT NOT NULL DEFAULT ''",
+            "verkoper": "TEXT NOT NULL DEFAULT ''",
+            "email": "TEXT NOT NULL DEFAULT ''",
+            "opmerking": "TEXT NOT NULL DEFAULT ''",
+            "maat": "TEXT",
+            "filiaal": "TEXT",
+            "collega": "TEXT",
+            "contactstatus": "TEXT",
+            "betaalstatus": "TEXT",
+            "bestelstatus": "TEXT",
+            "productcode": "TEXT",
+            "eancode": "TEXT",
+            "adviesprijs": "REAL",
+            "afgerond": "INTEGER NOT NULL DEFAULT 0",
+            "created_at": "TEXT",
+            "reminder_last_sent_at": "TEXT",
+        }
+        for column_name, declaration in expected_columns.items():
+            if column_name not in existing_columns:
+                LOGGER.info("Databasekolom toevoegen: %s", column_name)
+                conn.execute(
+                    f'ALTER TABLE requests ADD COLUMN "{column_name}" {declaration}'
+                )
 
-        if not _column_exists(conn, "requests", "maat"):
-            conn.execute("ALTER TABLE requests ADD COLUMN maat TEXT")
-
-        if not _column_exists(conn, "requests", "reminder_last_sent_at"):
-            conn.execute("ALTER TABLE requests ADD COLUMN reminder_last_sent_at TEXT")
+        conn.execute(
+            "UPDATE requests SET created_at=? WHERE created_at IS NULL OR created_at=''",
+            (_dt_str(datetime.now()),),
+        )
+        conn.execute("UPDATE requests SET afgerond=0 WHERE afgerond IS NULL")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_open_created ON requests(afgerond, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_open_lastsent ON requests(afgerond, reminder_last_sent_at)")
 
+    with db_connection() as conn:
+        integrity = conn.execute("PRAGMA quick_check").fetchone()
+        if not integrity or integrity[0] != "ok":
+            raise DataMigrationError(
+                f"Database-integriteitscontrole mislukt: {integrity[0] if integrity else 'onbekend'}"
+            )
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+
+    try:
+        _create_daily_database_backup()
+    except (OSError, sqlite3.Error):
+        LOGGER.exception("Dagelijkse databaseback-up kon niet worden gemaakt")
+
+
+def _create_daily_database_backup():
+    source = Path(_db_path())
+    if not source.is_file():
+        return
+
+    backup_dir = Path(_appdata_dir()) / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    destination = backup_dir / f"store-{datetime.now():%Y%m%d}.db"
+    if not destination.exists():
+        _migrate_database(source, destination)
+        LOGGER.info("Dagelijkse databaseback-up gemaakt: %s", destination)
+
+    backups = sorted(
+        backup_dir.glob("store-*.db"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for old_backup in backups[BACKUP_RETENTION:]:
+        try:
+            old_backup.unlink()
+        except OSError:
+            LOGGER.warning("Oude databaseback-up kon niet worden verwijderd: %s", old_backup)
+
 
 def add_request(data):
-    with connect() as conn:
+    with db_connection() as conn:
         cursor = conn.execute(
             """
             INSERT INTO requests (
@@ -358,7 +708,7 @@ def add_request(data):
 
 
 def get_all_requests():
-    with connect() as conn:
+    with db_connection() as conn:
         open_rows = conn.execute(
             f"SELECT {REQUEST_COLUMNS} FROM requests WHERE afgerond=0 ORDER BY id DESC"
         ).fetchall()
@@ -369,28 +719,69 @@ def get_all_requests():
 
 
 def get_request_by_id(row_id: int):
-    with connect() as conn:
+    with db_connection() as conn:
         return conn.execute(
             f"SELECT {REQUEST_COLUMNS} FROM requests WHERE id=?",
             (row_id,),
         ).fetchone()
 
 
+def set_request_completed(row_id: int, completed: bool) -> bool:
+    with db_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE requests SET afgerond=? WHERE id=?",
+            (1 if completed else 0, row_id),
+        )
+        return cursor.rowcount == 1
+
+
+def update_request(data) -> bool:
+    with db_connection() as conn:
+        cursor = conn.execute(
+            """UPDATE requests
+               SET klantnaam=?, verkoper=?, email=?, opmerking=?, maat=?,
+                   filiaal=?, collega=?, contactstatus=?, betaalstatus=?, bestelstatus=?,
+                   productcode=?, eancode=?, adviesprijs=?
+               WHERE id=?""",
+            data,
+        )
+        return cursor.rowcount == 1
+
+
 # ------------------------
 # SETTINGS (JSON)
 # ------------------------
+def _write_json_atomic(path: Path, data):
+    temp_path = path.with_name(
+        f"{path.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+    )
+    try:
+        with temp_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
 def load_settings():
-    path = _settings_path()
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    with _SETTINGS_LOCK:
+        path = _settings_path()
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
 
 
 def save_settings(data):
-    path = _settings_path()
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+    with _SETTINGS_LOCK:
+        _write_json_atomic(Path(_settings_path()), data)
 
 
 def get_setting(key):
@@ -398,9 +789,10 @@ def get_setting(key):
 
 
 def set_setting(key, value):
-    settings = load_settings()
-    settings[key] = value
-    save_settings(settings)
+    with _SETTINGS_LOCK:
+        settings = load_settings()
+        settings[key] = value
+        save_settings(settings)
 
 
 def get_active_theme() -> str:
@@ -431,9 +823,15 @@ class EmailWorker(QRunnable):
     def run(self):
         try:
             result = self.fn(*self.args, **self.kwargs)
-            self.signals.finished.emit(result)
+            try:
+                self.signals.finished.emit(result)
+            except RuntimeError:
+                LOGGER.info("Achtergrondtaak afgerond nadat het venster was gesloten")
         except Exception as e:
-            self.signals.error.emit(str(e))
+            try:
+                self.signals.error.emit(str(e))
+            except RuntimeError:
+                LOGGER.warning("Achtergrondtaak mislukte na afsluiten: %s", e)
 
 
 def _require_email_password():
@@ -446,18 +844,95 @@ def _require_email_password():
         )
 
 
-def send_test_email(receiver):
-    _require_email_password()
+class EmailQuotaExceededError(RuntimeError):
+    pass
 
+
+class EmailCooldownError(RuntimeError):
+    pass
+
+
+def _email_quota_cooldown_until():
+    raw_value = str(get_setting("email_quota_cooldown_until") or "").strip()
+    if not raw_value:
+        return None
+    try:
+        cooldown_until = datetime.fromisoformat(raw_value)
+    except ValueError:
+        set_setting("email_quota_cooldown_until", "")
+        return None
+    if cooldown_until <= datetime.now():
+        set_setting("email_quota_cooldown_until", "")
+        return None
+    return cooldown_until
+
+
+def _format_cooldown(cooldown_until: datetime) -> str:
+    return cooldown_until.strftime("%d-%m-%Y om %H:%M")
+
+
+def _smtp_send_message(msg: EmailMessage):
+    """Send once, and stop retrying locally after Gmail reports its daily limit."""
+    _require_email_password()
+    cooldown_until = _email_quota_cooldown_until()
+    if cooldown_until is not None:
+        raise EmailCooldownError(
+            "E-mailverzending is tijdelijk gepauzeerd tot "
+            f"{_format_cooldown(cooldown_until)}, omdat Gmail eerder meldde dat "
+            "de dagelijkse verzendlimiet is bereikt. De opgeslagen gegevens blijven behouden."
+        )
+
+    try:
+        with smtplib.SMTP_SSL(
+            SMTP_SERVER, SMTP_PORT, timeout=EMAIL_TIMEOUT_SECONDS
+        ) as server:
+            server.login(SENDER_EMAIL, APP_PASSWORD)
+            server.send_message(msg)
+    except smtplib.SMTPResponseException as exc:
+        detail = exc.smtp_error
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", errors="replace")
+        detail = str(detail).replace("\\n", " ").strip()
+        is_daily_limit = exc.smtp_code == 550 and (
+            "5.4.5" in detail or "daily user sending limit" in detail.lower()
+        )
+        if is_daily_limit:
+            cooldown_until = datetime.now() + timedelta(hours=EMAIL_QUOTA_COOLDOWN_HOURS)
+            set_setting(
+                "email_quota_cooldown_until",
+                cooldown_until.isoformat(timespec="seconds"),
+            )
+            LOGGER.error(
+                "Gmail-verzendlimiet bereikt; verzending gepauzeerd tot %s",
+                cooldown_until,
+            )
+            raise EmailQuotaExceededError(
+                "Gmail heeft de dagelijkse verzendlimiet bereikt. Nieuwe e-mails worden "
+                f"op deze computer gepauzeerd tot {_format_cooldown(cooldown_until)}. "
+                "De bestelling is wel opgeslagen."
+            ) from exc
+        if isinstance(exc, smtplib.SMTPAuthenticationError):
+            raise RuntimeError(
+                "Aanmelden bij Gmail is mislukt. Controleer het Gmail-account en het app-wachtwoord."
+            ) from exc
+        raise RuntimeError(
+            f"Gmail heeft de e-mail geweigerd (code {exc.smtp_code}): {detail}"
+        ) from exc
+    except (TimeoutError, OSError, smtplib.SMTPException) as exc:
+        raise RuntimeError(
+            "De e-mailserver is niet bereikbaar of reageerde niet op tijd. "
+            "Controleer de internetverbinding en probeer het later opnieuw."
+        ) from exc
+
+
+def send_test_email(receiver):
     msg = EmailMessage()
     msg["Subject"] = "Test Email - Intersport Reminder App"
     msg["From"] = SENDER_EMAIL
     msg["To"] = receiver
     msg.set_content("Dit is een testmail vanuit de Intersport Reminder App.")
 
-    with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
-        server.login(SENDER_EMAIL, APP_PASSWORD)
-        server.send_message(msg)
+    _smtp_send_message(msg)
 
 
 def send_customer_arrival_email(request_row):
@@ -554,9 +1029,7 @@ def send_customer_arrival_email(request_row):
             filename=os.path.basename(logo_path),
         )
 
-    with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
-        server.login(SENDER_EMAIL, APP_PASSWORD)
-        server.send_message(msg)
+    _smtp_send_message(msg)
 
 
 def send_customer_confirmation_email(request_row):
@@ -658,9 +1131,7 @@ def send_customer_confirmation_email(request_row):
             filename=os.path.basename(logo_path),
         )
 
-    with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
-        server.login(SENDER_EMAIL, APP_PASSWORD)
-        server.send_message(msg)
+    _smtp_send_message(msg)
 
 
 def _parse_dt(value):
@@ -691,10 +1162,13 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
 
-        self.threadpool = QThreadPool.globalInstance()
+        self.threadpool = QThreadPool(self)
+        self.threadpool.setMaxThreadCount(MAX_EMAIL_WORKERS)
+        self._closing = False
         self._active_email_workers = []
         self._manual_reminders_in_progress = False
         self._auto_reminders_in_progress = False
+        self._next_auto_reminder_check_at = None
 
         self.setWindowTitle("INTERSPORT • Reminders")
         self.resize(1360, 720)
@@ -714,13 +1188,41 @@ class MainWindow(QWidget):
         self.setLayout(root)
 
         self.load_styles()
-        self.refresh_table()
+        self.refresh_table(raise_errors=True)
 
-        self.run_auto_reminder_check_once()
+        self.startup_reminder_timer = QTimer(self)
+        self.startup_reminder_timer.setSingleShot(True)
+        self.startup_reminder_timer.setInterval(3000)
+        self.startup_reminder_timer.timeout.connect(self.run_auto_reminder_check_once)
+        self.startup_reminder_timer.start()
+
         self.reminder_timer = QTimer(self)
-        self.reminder_timer.setInterval(AUTO_CHECK_EVERY_MS)
-        self.reminder_timer.timeout.connect(self.run_auto_reminder_check_once)
+        self.reminder_timer.setInterval(REMINDER_HEARTBEAT_MS)
+        self.reminder_timer.timeout.connect(self._run_reminder_heartbeat)
         self.reminder_timer.start()
+
+    def _track_email_worker(self, worker: EmailWorker):
+        self._active_email_workers.append(worker)
+        return worker
+
+    def _release_email_worker(self, worker: EmailWorker):
+        try:
+            self._active_email_workers.remove(worker)
+        except ValueError:
+            pass
+
+    def closeEvent(self, event):
+        self._closing = True
+        self.startup_reminder_timer.stop()
+        self.reminder_timer.stop()
+        self.search_filter_timer.stop()
+        self.threadpool.clear()
+        if self.threadpool.activeThreadCount():
+            LOGGER.info(
+                "Applicatie sluit terwijl %s achtergrondtaak/taken nog afronden",
+                self.threadpool.activeThreadCount(),
+            )
+        event.accept()
 
     def _build_header(self) -> QWidget:
         bar = QFrame()
@@ -927,7 +1429,13 @@ class MainWindow(QWidget):
         self.search = QLineEdit()
         self.search.setObjectName("SearchField")
         self.search.setPlaceholderText("Zoeken (klant, product, EAN, maat, bestelling, filiaal, verkoper...)")
-        self.search.textChanged.connect(self.filter_tables)
+        self.search_filter_timer = QTimer(self)
+        self.search_filter_timer.setSingleShot(True)
+        self.search_filter_timer.setInterval(200)
+        self.search_filter_timer.timeout.connect(
+            lambda: self.filter_tables(self.search.text())
+        )
+        self.search.textChanged.connect(lambda _text: self.search_filter_timer.start())
 
         top_row.addWidget(QLabel("Zoek:"))
         top_row.addWidget(self.search, 1)
@@ -1089,21 +1597,85 @@ class MainWindow(QWidget):
         info.setObjectName("HintText")
         lay.addWidget(info)
 
-        credit = QLabel("© 2026 Alexander Brinkman. Alle rechten voorbehouden. V1.1.2.0")
+        credit = QLabel(f"© 2026 Alexander Brinkman. Alle rechten voorbehouden. V{APP_VERSION}")
         credit.setObjectName("FooterCredit")
         credit.setAlignment(Qt.AlignRight)
         lay.addWidget(credit)
 
         outer.addWidget(card)
+
+        storage_card = QFrame()
+        storage_card.setObjectName("Card")
+        storage_layout = QVBoxLayout(storage_card)
+        storage_layout.setContentsMargins(18, 18, 18, 18)
+        storage_layout.setSpacing(12)
+
+        storage_title = QLabel("Gegevensopslag")
+        storage_title.setObjectName("CardTitle")
+        storage_layout.addWidget(storage_title)
+
+        storage_form = QFormLayout()
+        storage_form.setHorizontalSpacing(14)
+        self.data_path_input = QLineEdit(_appdata_dir())
+        self.data_path_input.setReadOnly(True)
+        self.data_path_input.setToolTip(_appdata_dir())
+        storage_form.addRow("Actieve gegevensmap", self.data_path_input)
+        storage_layout.addLayout(storage_form)
+
+        storage_buttons = QHBoxLayout()
+        storage_buttons.addStretch(1)
+        open_storage_btn = QPushButton("Open gegevensmap")
+        open_storage_btn.setObjectName("BtnSecondary")
+        open_storage_btn.setMinimumHeight(36)
+        open_storage_btn.clicked.connect(self.open_data_folder)
+        storage_buttons.addWidget(open_storage_btn)
+        storage_layout.addLayout(storage_buttons)
+
+        storage_info = QLabel(
+            f"Database: {DB_FILENAME}  •  Instellingen: {SETTINGS_FILENAME}\n"
+            f"Diagnostisch logboek: {_LOG_PATH or 'niet actief'}"
+        )
+        storage_info.setObjectName("HintText")
+        storage_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        storage_info.setWordWrap(True)
+        storage_layout.addWidget(storage_info)
+
+        if _MIGRATION_NOTICES:
+            migration_info = QLabel("\n".join(_MIGRATION_NOTICES))
+            migration_info.setObjectName("HintText")
+            migration_info.setWordWrap(True)
+            storage_layout.addWidget(migration_info)
+
+        outer.addWidget(storage_card)
         outer.addStretch(1)
         return widget
+
+    def open_data_folder(self):
+        data_dir = _appdata_dir()
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(data_dir)):
+            QMessageBox.warning(
+                self,
+                "Map openen mislukt",
+                f"De gegevensmap kon niet worden geopend.\n\n{data_dir}",
+            )
 
     def save_settings(self):
         email = self.reminder_email_input.text().strip()
         theme = self.style_theme_input.currentText().strip() or "Intersport"
 
-        set_setting("reminder_email", email)
-        set_setting("style_theme", theme)
+        try:
+            settings = load_settings()
+            settings["reminder_email"] = email
+            settings["style_theme"] = theme
+            save_settings(settings)
+        except (OSError, TypeError) as exc:
+            QMessageBox.critical(
+                self,
+                "Opslaan mislukt",
+                f"De instellingen konden niet worden opgeslagen.\n\n"
+                f"Map: {_appdata_dir()}\nReden: {exc}",
+            )
+            return
 
         if not self.test_email_input.text().strip():
             self.test_email_input.setText(email)
@@ -1120,14 +1692,21 @@ class MainWindow(QWidget):
         self.test_btn.setEnabled(False)
         self.test_btn.setText("Versturen...")
 
-        worker = EmailWorker(send_test_email, receiver)
+        worker = self._track_email_worker(EmailWorker(send_test_email, receiver))
 
         def _ok(_):
+            self._release_email_worker(worker)
+            if self._closing:
+                return
             self.test_btn.setEnabled(True)
             self.test_btn.setText("Verstuur test e-mail")
             QMessageBox.information(self, "Gelukt", f"Test e-mail succesvol verzonden naar:\n{receiver}")
 
         def _err(msg: str):
+            self._release_email_worker(worker)
+            LOGGER.warning("Test-e-mail mislukt: %s", msg)
+            if self._closing:
+                return
             self.test_btn.setEnabled(True)
             self.test_btn.setText("Verstuur test e-mail")
             QMessageBox.critical(self, "E-mail fout", f"Test e-mail kon niet worden verzonden.\n\nReden:\n{msg}")
@@ -1166,6 +1745,8 @@ class MainWindow(QWidget):
         if prijs_text:
             try:
                 prijs = float(prijs_text.replace(",", "."))
+                if not math.isfinite(prijs):
+                    raise ValueError
             except ValueError:
                 QMessageBox.warning(self, "Fout", "Adviesprijs moet een getal zijn (bijv. 123,45).")
                 return
@@ -1187,8 +1768,27 @@ class MainWindow(QWidget):
             _dt_str(datetime.now()),
         )
 
-        new_row_id = add_request(data)
-        new_row = get_request_by_id(new_row_id)
+        try:
+            new_row_id = add_request(data)
+            LOGGER.info("Bestelling opgeslagen met id %s", new_row_id)
+        except (OSError, sqlite3.Error) as exc:
+            LOGGER.exception("Bestelling opslaan mislukt")
+            QMessageBox.critical(
+                self,
+                "Bestelling opslaan mislukt",
+                f"De bestelling kon niet in de database worden opgeslagen.\n\n"
+                f"Database: {_db_path()}\nReden: {exc}",
+            )
+            return
+
+        try:
+            new_row = get_request_by_id(new_row_id)
+        except (OSError, sqlite3.Error):
+            LOGGER.exception(
+                "Opgeslagen bestelling %s kon niet opnieuw worden geladen; bevestigingsmail overgeslagen",
+                new_row_id,
+            )
+            new_row = None
 
         for _, w in self.inputs.items():
             if isinstance(w, QLineEdit):
@@ -1200,17 +1800,15 @@ class MainWindow(QWidget):
         self.tabs.setCurrentIndex(1)
 
         if new_row and is_email(normalized_contact):
-            worker = EmailWorker(send_customer_confirmation_email, new_row)
-            self._active_email_workers.append(worker)
+            worker = self._track_email_worker(EmailWorker(send_customer_confirmation_email, new_row))
 
             def _cleanup():
-                try:
-                    self._active_email_workers.remove(worker)
-                except ValueError:
-                    pass
+                self._release_email_worker(worker)
 
             def _ok(_):
                 _cleanup()
+                if self._closing:
+                    return
                 QMessageBox.information(
                     self,
                     "Succes",
@@ -1219,6 +1817,9 @@ class MainWindow(QWidget):
 
             def _err(msg: str):
                 _cleanup()
+                LOGGER.warning("Bevestigingsmail mislukt voor bestelling %s: %s", new_row_id, msg)
+                if self._closing:
+                    return
                 QMessageBox.warning(
                     self,
                     "Opgeslagen, maar e-mail mislukt",
@@ -1239,7 +1840,7 @@ class MainWindow(QWidget):
         cutoff_open_str = _dt_str(now - timedelta(days=REMINDER_AFTER_DAYS))
         repeat_cutoff_str = _dt_str(now - timedelta(days=REMINDER_REPEAT_DAYS))
 
-        with connect() as conn:
+        with db_connection() as conn:
             return conn.execute(
                 f"""
                 SELECT {REQUEST_COLUMNS}
@@ -1256,86 +1857,81 @@ class MainWindow(QWidget):
                 (cutoff_open_str, repeat_cutoff_str),
             ).fetchall()
 
-    def _send_reminder_email_for_row(self, request_row):
+    def _send_reminder_digest(self, request_rows):
         receiver = get_setting("reminder_email")
         if not receiver:
             raise RuntimeError("Geen reminder e-mail ingesteld in Instellingen.")
 
-        klant = (request_row["klantnaam"] or "").strip()
-        verkoper = (request_row["verkoper"] or "").strip()
-        contact = (request_row["email"] or "").strip()
-        bestelling = (request_row["opmerking"] or "").strip()
-        productcode = (request_row["productcode"] or "").strip()
-        eancode = (request_row["eancode"] or "").strip()
-        created_at = (request_row["created_at"] or "").strip()
-        row_id = request_row["id"]
+        rows = list(request_rows)
+        if not rows:
+            return 0
 
-        created_display = created_at
-        try:
-            created_display = datetime.fromisoformat(created_at).strftime("%d-%m-%Y %H:%M")
-        except Exception:
-            pass
+        text_entries = []
+        html_entries = []
+        for index, request_row in enumerate(rows, start=1):
+            values = {
+                "klant": (request_row["klantnaam"] or "").strip(),
+                "verkoper": (request_row["verkoper"] or "").strip(),
+                "contact": (request_row["email"] or "").strip(),
+                "bestelling": (request_row["opmerking"] or "").strip(),
+                "productcode": (request_row["productcode"] or "").strip(),
+                "eancode": (request_row["eancode"] or "").strip(),
+                "created": (request_row["created_at"] or "").strip(),
+            }
+            try:
+                values["created"] = datetime.fromisoformat(values["created"]).strftime(
+                    "%d-%m-%Y %H:%M"
+                )
+            except (TypeError, ValueError):
+                pass
 
-        subject = f"Reminder: bestelling van {klant} staat nog open"
+            text_entries.append(
+                f"{index}. {values['klant']}\n"
+                f"   Verkoper: {values['verkoper']}\n"
+                f"   Contact: {values['contact']}\n"
+                f"   Bestelling: {values['bestelling']}\n"
+                f"   Productcode: {values['productcode']}\n"
+                f"   EAN-code: {values['eancode']}\n"
+                f"   Aangemaakt: {values['created']}"
+            )
+            safe = {key: html.escape(value) for key, value in values.items()}
+            html_entries.append(
+                "<tr>"
+                f"<td>{index}</td><td>{safe['klant']}</td><td>{safe['verkoper']}</td>"
+                f"<td>{safe['contact']}</td><td>{safe['bestelling']}</td>"
+                f"<td>{safe['productcode']}</td><td>{safe['eancode']}</td>"
+                f"<td>{safe['created']}</td>"
+                "</tr>"
+            )
 
+        count = len(rows)
+        subject = f"Reminder: {count} openstaande bestelling{'en' if count != 1 else ''}"
         text_body = (
             "Beste collega,\n\n"
-            "Er staat een bestelling/verzoek langer dan 7 dagen open.\n\n"
-            "Overzicht van de bestelling:\n"
-            f"- Klantnaam: {klant}\n"
-            f"- Verkoper: {verkoper}\n"
-            f"- E-mail of telefoonnummer: {contact}\n"
-            f"- Bestelling / opmerking: {bestelling}\n"
-            f"- Productcode: {productcode}\n"
-            f"- EAN-code: {eancode}\n"
-            f"- Aangemaakt op: {created_display}\n\n"
-            "Wil je deze bestelling controleren en indien mogelijk afronden?"
+            f"Er {'staan' if count != 1 else 'staat'} {count} bestelling"
+            f"{'en' if count != 1 else ''} langer dan 7 dagen open.\n\n"
+            + "\n\n".join(text_entries)
+            + "\n\nWil je deze bestellingen controleren en indien mogelijk afronden?"
         )
-
+        html_rows = "".join(html_entries)
         html_body = f"""
         <html>
         <body style="margin:0; padding:0; background-color:#f4f6f8; font-family:Arial, Helvetica, sans-serif; color:#1f2937;">
-            <div style="max-width:720px; margin:0 auto; padding:32px 20px;">
+            <div style="max-width:1100px; margin:0 auto; padding:32px 20px;">
             <div style="background:#ffffff; border-radius:14px; overflow:hidden; border:1px solid #e5e7eb;">
                 <div style="background:#1e3a8a; padding:20px 24px;">
-                <h1 style="margin:0; font-size:22px; line-height:1.3; color:#ffffff;">Reminder openstaande bestelling</h1>
+                <h1 style="margin:0; font-size:22px; line-height:1.3; color:#ffffff;">{count} openstaande bestelling{'en' if count != 1 else ''}</h1>
                 </div>
 
                 <div style="padding:24px;">
                 <p style="margin:0 0 16px 0; font-size:15px;">Beste collega,</p>
                 <p style="margin:0 0 20px 0; font-size:15px; line-height:1.6;">
-                    Er staat een bestelling/verzoek langer dan 7 dagen open. Hieronder vind je een overzicht van alle verplichte velden van deze entry.
+                    Hieronder staan de bestellingen die langer dan 7 dagen openstaan.
                 </p>
 
-                <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse; margin:0 0 20px 0;">
-                    <tr>
-                    <td style="padding:12px 14px; background:#f9fafb; border:1px solid #e5e7eb; font-weight:bold;">Klantnaam</td>
-                    <td style="padding:12px 14px; background:#ffffff; border:1px solid #e5e7eb;">{klant}</td>
-                    </tr>
-                    <tr>
-                    <td style="padding:12px 14px; background:#f9fafb; border:1px solid #e5e7eb; font-weight:bold;">Verkoper</td>
-                    <td style="padding:12px 14px; background:#ffffff; border:1px solid #e5e7eb;">{verkoper}</td>
-                    </tr>
-                    <tr>
-                    <td style="padding:12px 14px; background:#f9fafb; border:1px solid #e5e7eb; font-weight:bold;">E-mail of telefoonnummer</td>
-                    <td style="padding:12px 14px; background:#ffffff; border:1px solid #e5e7eb;">{contact}</td>
-                    </tr>
-                    <tr>
-                    <td style="padding:12px 14px; background:#f9fafb; border:1px solid #e5e7eb; font-weight:bold;">Bestelling / opmerking</td>
-                    <td style="padding:12px 14px; background:#ffffff; border:1px solid #e5e7eb;">{bestelling}</td>
-                    </tr>
-                    <tr>
-                    <td style="padding:12px 14px; background:#f9fafb; border:1px solid #e5e7eb; font-weight:bold;">Productcode</td>
-                    <td style="padding:12px 14px; background:#ffffff; border:1px solid #e5e7eb;">{productcode}</td>
-                    </tr>
-                    <tr>
-                    <td style="padding:12px 14px; background:#f9fafb; border:1px solid #e5e7eb; font-weight:bold;">EAN-code</td>
-                    <td style="padding:12px 14px; background:#ffffff; border:1px solid #e5e7eb;">{eancode}</td>
-                    </tr>
-                    <tr>
-                    <td style="padding:12px 14px; background:#f9fafb; border:1px solid #e5e7eb; font-weight:bold;">Aangemaakt op</td>
-                    <td style="padding:12px 14px; background:#ffffff; border:1px solid #e5e7eb;">{created_display}</td>
-                    </tr>
+                <table cellpadding="8" cellspacing="0" border="1" width="100%" style="border-collapse:collapse; margin:0 0 20px 0; border-color:#e5e7eb; font-size:13px;">
+                    <thead style="background:#f9fafb;"><tr><th>#</th><th>Klant</th><th>Verkoper</th><th>Contact</th><th>Bestelling</th><th>Productcode</th><th>EAN</th><th>Aangemaakt</th></tr></thead>
+                    <tbody>{html_rows}</tbody>
                 </table>
 
                 <p style="margin:0 0 18px 0; font-size:15px; line-height:1.6;">
@@ -1355,31 +1951,66 @@ class MainWindow(QWidget):
         msg.set_content(text_body)
         msg.add_alternative(html_body, subtype="html")
 
-        _require_email_password()
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
-            server.login(SENDER_EMAIL, APP_PASSWORD)
-            server.send_message(msg)
+        _smtp_send_message(msg)
+        return count
 
-    def _mark_reminder_sent(self, row_id: int):
-        with connect() as conn:
-            conn.execute(
+    def _mark_reminders_sent(self, row_ids):
+        sent_at = _dt_str(datetime.now())
+        with db_connection() as conn:
+            conn.executemany(
                 "UPDATE requests SET reminder_last_sent_at=? WHERE id=?",
-                (_dt_str(datetime.now()), row_id),
+                ((sent_at, row_id) for row_id in row_ids),
             )
 
     def _run_reminders(self, auto: bool):
+        if self._closing or self._auto_reminders_in_progress or self._manual_reminders_in_progress:
+            return
+
+        reminder_receiver = str(get_setting("reminder_email") or "").strip()
+        if not reminder_receiver:
+            LOGGER.info("Remindercontrole overgeslagen: geen reminderadres ingesteld")
+            if not auto:
+                QMessageBox.warning(
+                    self,
+                    "Reminders",
+                    "Stel eerst een reminder-e-mailadres in bij Instellingen.",
+                )
+            return
+
+        cooldown_until = _email_quota_cooldown_until()
+        if cooldown_until is not None:
+            message = (
+                "E-mailverzending is tijdelijk gepauzeerd tot "
+                f"{_format_cooldown(cooldown_until)}, omdat de dagelijkse Gmail-limiet "
+                "is bereikt. De openstaande bestellingen blijven bewaard."
+            )
+            LOGGER.info("Remindercontrole overgeslagen: %s", message)
+            if not auto:
+                QMessageBox.warning(self, "Reminders gepauzeerd", message)
+            return
+
         if auto:
-            if self._auto_reminders_in_progress:
-                return
             self._auto_reminders_in_progress = True
         else:
-            if self._manual_reminders_in_progress:
-                return
             self._manual_reminders_in_progress = True
             self.manual_send_btn.setEnabled(False)
             self.manual_send_btn.setText("Bezig...")
 
-        candidates = self._get_reminder_candidates()
+        try:
+            candidates = self._get_reminder_candidates()
+        except (OSError, sqlite3.Error) as exc:
+            LOGGER.exception("Reminder-kandidaten konden niet worden geladen")
+            self._auto_reminders_in_progress = False
+            self._manual_reminders_in_progress = False
+            if not auto and not self._closing:
+                self.manual_send_btn.setEnabled(True)
+                self.manual_send_btn.setText("Verstuur reminders nu")
+                QMessageBox.critical(
+                    self,
+                    "Reminders mislukt",
+                    f"De database kon niet worden gelezen.\n\n{exc}",
+                )
+            return
 
         if not candidates:
             if auto:
@@ -1395,52 +2026,73 @@ class MainWindow(QWidget):
                 )
             return
 
-        state = {"auto": auto, "pending": len(candidates), "sent": 0, "failed": 0}
+        row_ids = [row["id"] for row in candidates]
+        worker = self._track_email_worker(
+            EmailWorker(self._send_reminder_digest, candidates)
+        )
 
-        def _finalize():
-            if state["auto"]:
+        def _restore_controls():
+            if auto:
                 self._auto_reminders_in_progress = False
             else:
                 self._manual_reminders_in_progress = False
-                self.manual_send_btn.setEnabled(True)
-                self.manual_send_btn.setText("Verstuur reminders nu")
+                if not self._closing:
+                    self.manual_send_btn.setEnabled(True)
+                    self.manual_send_btn.setText("Verstuur reminders nu")
 
-                if state["failed"] == 0:
-                    QMessageBox.information(self, "Reminders", f"Reminders verzonden: {state['sent']}")
-                else:
+        def _ok(sent_count, current_worker=worker):
+            self._release_email_worker(current_worker)
+            try:
+                self._mark_reminders_sent(row_ids)
+            except Exception as exc:
+                LOGGER.exception("Reminderstatus kon niet worden opgeslagen")
+                _restore_controls()
+                if not auto and not self._closing:
                     QMessageBox.warning(
                         self,
-                        "Reminders",
-                        f"Reminders verzonden: {state['sent']}\nMislukt: {state['failed']}",
+                        "Reminder verzonden, status niet opgeslagen",
+                        "De reminder is verzonden, maar de database kon niet worden bijgewerkt. "
+                        f"De reminder kan later nogmaals verschijnen.\n\n{exc}",
                     )
+                return
+            _restore_controls()
+            if not auto and not self._closing:
+                QMessageBox.information(
+                    self,
+                    "Reminders",
+                    f"Eén overzichtsmail verzonden voor {sent_count} openstaande "
+                    f"bestelling{'en' if sent_count != 1 else ''}.",
+                )
 
-        for row in candidates:
-            row_id = row["id"]
-            worker = EmailWorker(self._send_reminder_email_for_row, row)
+        def _err(message: str, current_worker=worker):
+            self._release_email_worker(current_worker)
+            LOGGER.warning("Reminder-overzicht mislukt: %s", message)
+            _restore_controls()
+            if not auto and not self._closing:
+                QMessageBox.warning(self, "Reminders mislukt", message)
 
-            def _ok(_result=None, rid=row_id):
-                try:
-                    self._mark_reminder_sent(rid)
-                    state["sent"] += 1
-                except Exception:
-                    state["failed"] += 1
-                finally:
-                    state["pending"] -= 1
-                    if state["pending"] <= 0:
-                        _finalize()
-
-            def _err(_msg: str, rid=row_id):
-                state["failed"] += 1
-                state["pending"] -= 1
-                if state["pending"] <= 0:
-                    _finalize()
-
-            worker.signals.finished.connect(_ok)
-            worker.signals.error.connect(_err)
-            self.threadpool.start(worker)
+        worker.signals.finished.connect(_ok)
+        worker.signals.error.connect(_err)
+        self.threadpool.start(worker)
 
     def run_auto_reminder_check_once(self):
+        self._next_auto_reminder_check_at = datetime.now() + timedelta(
+            milliseconds=AUTO_CHECK_EVERY_MS
+        )
+        LOGGER.info(
+            "Automatische remindercontrole gestart; volgende controle rond %s",
+            _dt_str(self._next_auto_reminder_check_at),
+        )
         self._run_reminders(auto=True)
+
+    def _run_reminder_heartbeat(self):
+        """Use wall-clock scheduling so a delayed Qt timer catches up after sleep/resume."""
+        now = datetime.now()
+        if (
+            self._next_auto_reminder_check_at is None
+            or now >= self._next_auto_reminder_check_at
+        ):
+            self.run_auto_reminder_check_once()
 
     def send_all_reminders_manual(self):
         self._run_reminders(auto=False)
@@ -1511,16 +2163,24 @@ class MainWindow(QWidget):
             if col < table.columnCount():
                 table.setColumnWidth(col, w)
 
-        table.resizeRowsToContents()
-        max_row_height = 56
-        for row_idx in range(table.rowCount()):
-            if table.rowHeight(row_idx) > max_row_height:
-                table.setRowHeight(row_idx, max_row_height)
+        table.verticalHeader().setDefaultSectionSize(48)
 
         table.setSortingEnabled(True)
 
-    def refresh_table(self):
-        self.rows = get_all_requests()
+    def refresh_table(self, _checked=False, raise_errors=False):
+        try:
+            self.rows = get_all_requests()
+        except (OSError, sqlite3.Error) as exc:
+            LOGGER.exception("Dashboard kon niet uit de database worden geladen")
+            if raise_errors:
+                raise
+            QMessageBox.critical(
+                self,
+                "Database lezen mislukt",
+                f"Het dashboard kon niet worden vernieuwd.\n\n"
+                f"Database: {_db_path()}\nReden: {exc}",
+            )
+            return False
 
         rows_open = [r for r in self.rows if r["afgerond"] == 0]
         rows_done = [r for r in self.rows if r["afgerond"] == 1]
@@ -1530,6 +2190,7 @@ class MainWindow(QWidget):
 
         if hasattr(self, "search") and self.search.text().strip():
             self.filter_tables(self.search.text())
+        return True
 
     def filter_tables(self, text):
         text = text.lower().strip()
@@ -1556,7 +2217,11 @@ class MainWindow(QWidget):
             return None
 
     def mark_complete(self, row_id):
-        row_data = [r for r in self.rows if r["id"] == row_id][0]
+        row_data = next((r for r in self.rows if r["id"] == row_id), None)
+        if row_data is None:
+            QMessageBox.warning(self, "Niet gevonden", "Deze bestelling bestaat niet meer.")
+            self.refresh_table()
+            return
         reply = QMessageBox.question(
             self,
             "Bevestigen",
@@ -1567,15 +2232,25 @@ class MainWindow(QWidget):
         )
 
         if reply == QMessageBox.Yes:
-            with connect() as conn:
-                conn.execute("UPDATE requests SET afgerond=1 WHERE id=?", (row_id,))
+            try:
+                if not set_request_completed(row_id, True):
+                    raise LookupError("De bestelling bestaat niet meer.")
+            except (OSError, sqlite3.Error, LookupError) as exc:
+                LOGGER.exception("Bestelling %s kon niet worden afgerond", row_id)
+                QMessageBox.critical(self, "Afronden mislukt", str(exc))
+                return
             self.refresh_table()
 
     # =========================================================
     # CONTEXT MENU + ACTIONS
     # =========================================================
     def send_auto_message_to_customer(self, row_id: int):
-        row = get_request_by_id(row_id)
+        try:
+            row = get_request_by_id(row_id)
+        except (OSError, sqlite3.Error) as exc:
+            LOGGER.exception("Bestelling %s kon niet worden geladen", row_id)
+            QMessageBox.critical(self, "Database lezen mislukt", str(exc))
+            return
         if not row:
             QMessageBox.warning(self, "Fout", "Deze entry kon niet worden gevonden in de database.")
             return
@@ -1590,17 +2265,15 @@ class MainWindow(QWidget):
             return
 
         if is_email(contact_value):
-            worker = EmailWorker(send_customer_arrival_email, row)
-            self._active_email_workers.append(worker)
+            worker = self._track_email_worker(EmailWorker(send_customer_arrival_email, row))
 
             def _cleanup():
-                try:
-                    self._active_email_workers.remove(worker)
-                except ValueError:
-                    pass
+                self._release_email_worker(worker)
 
             def _ok(_):
                 _cleanup()
+                if self._closing:
+                    return
                 QMessageBox.information(
                     self,
                     "Bericht verzonden",
@@ -1609,6 +2282,9 @@ class MainWindow(QWidget):
 
             def _err(msg: str):
                 _cleanup()
+                LOGGER.warning("Aankomstmail mislukt voor bestelling %s: %s", row_id, msg)
+                if self._closing:
+                    return
                 QMessageBox.critical(
                     self,
                     "E-mail fout",
@@ -1671,9 +2347,14 @@ class MainWindow(QWidget):
         id_item = self.table_done.item(table_row, self.table_done.columnCount() - 1)
         if not id_item:
             return
-        row_id = int(id_item.text())
-        with connect() as conn:
-            conn.execute("UPDATE requests SET afgerond=0 WHERE id=?", (row_id,))
+        try:
+            row_id = int(id_item.text())
+            if not set_request_completed(row_id, False):
+                raise LookupError("De bestelling bestaat niet meer.")
+        except (ValueError, OSError, sqlite3.Error, LookupError) as exc:
+            LOGGER.exception("Bestelling kon niet worden heropend")
+            QMessageBox.critical(self, "Heropenen mislukt", str(exc))
+            return
         self.refresh_table()
 
     # =========================================================
@@ -1793,6 +2474,8 @@ class MainWindow(QWidget):
             if prijs_text:
                 try:
                     prijs = float(prijs_text.replace(",", "."))
+                    if not math.isfinite(prijs):
+                        raise ValueError
                 except ValueError:
                     QMessageBox.warning(dialog, "Fout", "Adviesprijs moet een getal zijn (bijv. 123,45).")
                     return
@@ -1816,15 +2499,17 @@ class MainWindow(QWidget):
                 int(row_data[14]),
             )
 
-            with connect() as conn:
-                conn.execute(
-                    """UPDATE requests
-                       SET klantnaam=?, verkoper=?, email=?, opmerking=?, maat=?,
-                           filiaal=?, collega=?, contactstatus=?, betaalstatus=?, bestelstatus=?,
-                           productcode=?, eancode=?, adviesprijs=?
-                       WHERE id=?""",
-                    data,
+            try:
+                if not update_request(data):
+                    raise LookupError("De bestelling bestaat niet meer.")
+            except (OSError, sqlite3.Error, LookupError) as exc:
+                LOGGER.exception("Bestelling %s kon niet worden bijgewerkt", row_data[14])
+                QMessageBox.critical(
+                    dialog,
+                    "Wijzigen mislukt",
+                    f"De bestelling kon niet worden opgeslagen.\n\n{exc}",
                 )
+                return
 
             dialog.accept()
             self.refresh_table()
@@ -1845,7 +2530,7 @@ class MainWindow(QWidget):
                     self.setStyleSheet(f.read())
                 return
             except Exception as e:
-                print(f"[STYLE] Could not load {qss_path}: {e}")
+                LOGGER.warning("Opmaakbestand kon niet worden geladen (%s): %s", qss_path, e)
 
         fallback_qss_path = resource_path(INTERSPORT_QSS_FILE)
         if os.path.exists(fallback_qss_path):
@@ -1854,7 +2539,11 @@ class MainWindow(QWidget):
                     self.setStyleSheet(f.read())
                 return
             except Exception as e:
-                print(f"[STYLE] Could not load fallback {fallback_qss_path}: {e}")
+                LOGGER.warning(
+                    "Terugval-opmaakbestand kon niet worden geladen (%s): %s",
+                    fallback_qss_path,
+                    e,
+                )
 
         # fallback
         self.setStyleSheet(
@@ -1874,11 +2563,67 @@ class MainWindow(QWidget):
 # RUN
 # ------------------------
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
+    global_instance_lock = None
+    diagnostics_error = None
+    try:
+        _configure_diagnostics()
+    except Exception as exc:
+        diagnostics_error = exc
 
-    init_db()
+    qInstallMessageHandler(_qt_message_handler)
+    sys.excepthook = _unhandled_exception_hook
 
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+    try:
+        app = QApplication(sys.argv)
+        app.setApplicationName(APP_NAME)
+    except Exception as exc:
+        _report_fatal_error("Qt kon niet worden gestart", exc)
+        sys.exit(1)
+
+    if diagnostics_error is not None:
+        QMessageBox.warning(
+            None,
+            "Diagnostiek niet beschikbaar",
+            f"Het diagnostische logboek kon niet worden aangemaakt.\n\n{diagnostics_error}",
+        )
+
+    LOGGER.info("IntersportApp %s wordt gestart", APP_VERSION)
+    LOGGER.info("MSIX package family: %s", _windows_package_family_name() or "niet verpakt")
+    LOGGER.info("Beoogde gegevensmap: %s", _canonical_appdata_dir())
+
+    try:
+        lock_directory = _canonical_appdata_dir()
+        lock_directory.mkdir(parents=True, exist_ok=True)
+        global_instance_lock = QLockFile(str(lock_directory / "IntersportApp.lock"))
+        global_instance_lock.setStaleLockTime(30_000)
+        if not global_instance_lock.tryLock(250):
+            LOGGER.warning("Tweede applicatie-instantie geblokkeerd")
+            QMessageBox.information(
+                None,
+                "IntersportApp is al geopend",
+                "Er draait al een exemplaar van IntersportApp voor deze gebruiker.\n\n"
+                "Sluit het andere venster voordat je de app opnieuw opent.",
+            )
+            sys.exit(0)
+    except (OSError, RuntimeError) as exc:
+        _report_fatal_error("Applicatievergrendeling aanmaken mislukt", exc)
+        sys.exit(1)
+
+    try:
+        init_db()
+        LOGGER.info("Database succesvol geïnitialiseerd: %s", _db_path())
+    except Exception as exc:
+        _report_fatal_error("Database initialiseren mislukt", exc)
+        sys.exit(1)
+
+    try:
+        window = MainWindow()
+        window.show()
+        LOGGER.info("Hoofdvenster succesvol geopend")
+    except Exception as exc:
+        _report_fatal_error("Hoofdvenster openen mislukt", exc)
+        sys.exit(1)
+
+    exit_code = app.exec()
+    LOGGER.info("Applicatie afgesloten met code %s", exit_code)
+    sys.exit(exit_code)
